@@ -46,7 +46,7 @@ export default function App() {
       </header>
       <div className="coda-corps">
         <aside className="coda-sidebar">
-          <HistoriqueSessions />
+          <HistoriqueSessions mode={modeAgent} />
         </aside>
         <main className="coda-chat">
           <ChatPanel projet={projet ?? undefined} />

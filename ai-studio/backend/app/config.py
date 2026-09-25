@@ -21,6 +21,9 @@ load_dotenv(PROJECT_ROOT / "backend" / ".env", override=False)
 # Dossier qui contient les projets importés (arborescences téléchargées / créées).
 DATA_DIR = PROJECT_ROOT / "data"
 PROJETS_DIR = Path(os.getenv("PROJETS_DIR", str(DATA_DIR / "projets")))
+# Mémoire durable des fils Chat/Edit. Elle ne dépend plus de la durée de vie
+# du processus backend (redémarrage du serveur ou rechargement en développement).
+MEMOIRE_DIR = Path(os.getenv("MEMOIRE_DIR", str(DATA_DIR / "sessions")))
 
 # Serveur OpenCode local (voir opencode_client.py).
 OPENCODE_BASE_URL = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096").rstrip("/")
@@ -54,10 +57,11 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 # (Groq `openai/gpt-oss-120b` = 8 000 TPM, ≈3,7 car./token) :
 # ~14 000 car. ≈ 3 800 tokens → un prompt + sa réponse tiennent dans la minute.
 ARBRE_CONTEXTE_MAX = int(os.getenv("ARBRE_CONTEXTE_MAX", "40"))
+ARBORESCENCE_CACHE_SECONDES = float(os.getenv("ARBORESCENCE_CACHE_SECONDES", "5"))
 FICHIER_CONTEXTE_MAX_CAR = int(os.getenv("FICHIER_CONTEXTE_MAX_CAR", "2500"))
 FICHIERS_CONTEXTE_MAX = int(os.getenv("FICHIERS_CONTEXTE_MAX", "3"))
 CONTEXTE_MAX_CAR = int(os.getenv("CONTEXTE_MAX_CAR", "14000"))
-MEMOIRE_ECHANGES_MAX = int(os.getenv("MEMOIRE_ECHANGES_MAX", "4"))
+MEMOIRE_ECHANGES_MAX = int(os.getenv("MEMOIRE_ECHANGES_MAX", "12"))
 
 # RAG — documents de cours (PDF/TXT/MD) et index FAISS.
 DOCUMENTS_DIR = Path(os.getenv("DOCUMENTS_DIR", str(DATA_DIR / "documents")))
@@ -78,5 +82,6 @@ CORS_ORIGINS = [
 def assurer_repertoires() -> None:
     """Crée les dossiers de données au démarrage."""
     PROJETS_DIR.mkdir(parents=True, exist_ok=True)
+    MEMOIRE_DIR.mkdir(parents=True, exist_ok=True)
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)

@@ -1,19 +1,28 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useDiscussions } from "../store/discussions";
 import { useStudio } from "../store/studio";
+import type { ModeAgent } from "../types/api";
 
-/** Colonne gauche de l'application : historique visible en Chat comme en Edit. */
-export function HistoriqueSessions() {
-  const sessions = useDiscussions((s) => s.sessions);
-  const activeId = useDiscussions((s) => s.activeId);
+interface HistoriqueSessionsProps {
+  mode: ModeAgent;
+}
+
+/** Colonne gauche : une liste indépendante pour Chat et une autre pour Edit. */
+export function HistoriqueSessions({ mode }: HistoriqueSessionsProps) {
+  const toutesSessions = useDiscussions((s) => s.sessions);
+  const sessions = useMemo(
+    () => toutesSessions.filter((session) => session.mode === mode),
+    [toutesSessions, mode],
+  );
+  const activeId = useDiscussions((s) => s.activeIds[mode]);
   const { nouvelle, ouvrir, renommer, supprimer } = useDiscussions();
   const setModeAgent = useStudio((s) => s.setModeAgent);
   const [enEdition, setEnEdition] = useState<string | null>(null);
   const [brouillon, setBrouillon] = useState("");
 
   function lancer() {
-    nouvelle();
-    setModeAgent("chat");
+    nouvelle(mode);
+    setModeAgent(mode);
   }
 
   function validerRename(id: string) {
@@ -25,10 +34,12 @@ export function HistoriqueSessions() {
     <div className="historique">
       <div className="sidebar-header">
         <span className="logo" />
-        <span className="sidebar-brand">Conversations</span>
+        <span className="sidebar-brand">
+          {mode === "chat" ? "Historique Chat" : "Historique Edit"}
+        </span>
       </div>
       <button className="historique-nouveau" onClick={lancer}>
-        ＋ Nouvelle discussion
+        {mode === "chat" ? "＋ Nouvelle discussion" : "＋ Nouvelle session Edit"}
       </button>
       <div className="historique-liste">
         {sessions.map((s) => (
@@ -74,7 +85,7 @@ export function HistoriqueSessions() {
               <button
                 title="Supprimer"
                 onClick={() => supprimer(s.id)}
-                disabled={s.id === activeId && useDiscussions.getState().sessions.length === 1}
+                disabled={s.id === activeId && sessions.length === 1}
               >
                 ✕
               </button>
@@ -82,7 +93,11 @@ export function HistoriqueSessions() {
           </div>
         ))}
         {sessions.length === 0 && (
-          <div className="rien">aucune conversation pour l'instant</div>
+          <div className="rien">
+            {mode === "chat"
+              ? "aucune discussion pour l'instant"
+              : "aucune session Edit pour l'instant"}
+          </div>
         )}
       </div>
     </div>

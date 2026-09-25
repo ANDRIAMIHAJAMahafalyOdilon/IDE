@@ -213,7 +213,9 @@ def mapper_ligne(
             })]
         compteur = int(etat_activites.get("__nb_etapes__", 0)) + 1
         etat_activites["__nb_etapes__"] = compteur
-        ident = f"step:{sid}:{compteur}"
+        # Un seul élément "analyse" est maintenu dans la timeline : les
+        # étapes successives mettent à jour cette carte au lieu de l'empiler.
+        ident = f"step:{sid}:current"
         etat_activites["__step_courant__"] = ident
         return [("activite", {
             "id": ident,
@@ -245,7 +247,10 @@ def _commande(binaire: str, racine: Path, message: str, sid: str | None) -> list
     if OPENCODE_MODEL:
         cmd += ["--model", OPENCODE_MODEL]
     if sid:
-        cmd += ["-s", sid, "--fork"]
+        # Reprendre la même session conserve le contexte et évite de cloner
+        # tout le fil à chaque requête. Le fork provoquait des relances et une
+        # perte de continuité visibles dans Edit.
+        cmd += ["-s", sid]
     cmd.append(message)
     return cmd
 
@@ -473,13 +478,13 @@ def mapper_evenement_serveur(
             "description": delta,
         })] if delta else sorties
     if genre in {"session.next.step.started", "step_start"}:
-        ident = str(evt.get("id") or "step")
+        ident = f"step:{sid}:current"
         return [("activite", {
             "id": ident, "type": "thinking", "status": "running",
             "title": "Analyse du projet",
         })]
     if genre in {"session.next.step.ended", "step_finish"}:
-        ident = str(evt.get("id") or "step")
+        ident = f"step:{sid}:current"
         return [("activite", {
             "id": ident, "type": "thinking", "status": "success",
             "title": "Analyse terminée",

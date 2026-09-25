@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { persist } from "zustand/middleware";
+import type { ModeAgent } from "../types/api";
 
 export interface MessageDisc {
   role: "user" | "assistant";
@@ -8,6 +9,8 @@ export interface MessageDisc {
 
 export interface SessionDisc {
   id: string;
+  /** Une session Chat ne doit jamais apparaître dans l'historique Edit, et inversement. */
+  mode: ModeAgent;
   /** Session backend (/api/agent/chat) une fois `debut` reçu ; null avant. */
   backend: string | null;
   titre: string;
@@ -32,9 +35,9 @@ function titrer(texte: string): string {
 
 interface EtatDiscussions {
   sessions: SessionDisc[];
-  activeId: string | null;
-  ouvrir: (id: string) => void;
-  nouvelle: () => string;
+  activeIds: Record<ModeAgent, string | null>;
+  ouvrir: (id: string, mode?: ModeAgent) => void;
+  nouvelle: (mode?: ModeAgent) => string;
   renommer: (id: string, titre: string) => void;
   supprimer: (id: string) => void;
   ajouterMessage: (id: string, role: "user" | "assistant", texte: string) => void;
@@ -47,19 +50,28 @@ export const useDiscussions = create<EtatDiscussions>()(
   persist(
     (set) => ({
       sessions: [],
-      activeId: null,
+      activeIds: { chat: null, edit: null },
 
-      ouvrir: (id) => set({ activeId: id }),
+      ouvrir: (id, mode) =>
+        set((s) => {
+          const session = s.sessions.find((x) => x.id === id);
+          const cible = mode ?? session?.mode ?? "chat";
+          return { activeIds: { ...s.activeIds, [cible]: id } };
+        }),
 
-      nouvelle: () => {
+      nouvelle: (mode = "chat") => {
         const session: SessionDisc = {
           id: genererId(),
+          mode,
           backend: null,
           titre: TITRE_PAR_DEFAUT,
           messages: [],
           moteur: null,
         };
-        set((s) => ({ sessions: [session, ...s.sessions], activeId: session.id }));
+        set((s) => ({
+          sessions: [session, ...s.sessions],
+          activeIds: { ...s.activeIds, [mode]: session.id },
+        }));
         return session.id;
       },
 
@@ -72,10 +84,15 @@ export const useDiscussions = create<EtatDiscussions>()(
 
       supprimer: (id) =>
         set((s) => {
+          const supprimee = s.sessions.find((x) => x.id === id);
           const sessions = s.sessions.filter((x) => x.id !== id);
-          const activeId =
-            s.activeId === id ? (sessions[0]?.id ?? null) : s.activeId;
-          return { sessions, activeId };
+          if (!supprimee) return { sessions };
+          const activeIds = { ...s.activeIds };
+          if (activeIds[supprimee.mode] === id) {
+            activeIds[supprimee.mode] =
+              sessions.find((x) => x.mode === supprimee.mode)?.id ?? null;
+          }
+          return { sessions, activeIds };
         }),
 
       ajouterMessage: (id, role, texte) =>
@@ -124,6 +141,29 @@ export const useDiscussions = create<EtatDiscussions>()(
           }),
         })),
     }),
-    { name: "ai-studio-discussions" },
+    {
+      name: "ai-studio-discussions",
+      version: 2,
+      migrate: (etatInconnu) => {
+        // Les versions précédentes n'avaient qu'un historique global. On le
+        // conserve dans Chat afin qu'une mise à jour ne fasse rien disparaître.
+        const ancien = etatInconnu as Partial<EtatDiscussions> & {
+          activeId?: string | null;
+        };
+        const sessions = (ancien.sessions ?? []).map((session) => ({
+          ...session,
+          mode: session.mode === "edit" ? "edit" : "chat",
+        }));
+        const anciensActifs = ancien.activeIds;
+        return {
+          ...ancien,
+          sessions,
+          activeIds: {
+            chat: anciensActifs?.chat ?? ancien.activeId ?? null,
+            edit: anciensActifs?.edit ?? null,
+          },
+        } as EtatDiscussions;
+      },
+    },
   ),
 );

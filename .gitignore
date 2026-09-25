@@ -13,6 +13,7 @@ logs/
 # Documents de cours et index RAG : fichiers volumineux/privés, non versionnés.
 ai-studio/data/documents/
 ai-studio/data/index/
+ai-studio/data/sessions/
 ai-studio/archive/
 ai-studio/data/organizer.db
 ai-studio/data/registre.json

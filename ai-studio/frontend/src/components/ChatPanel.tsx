@@ -1,9 +1,10 @@
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   appliquerModifs,
   arreterTache,
   chatAgent,
   choisirDossierNatif,
+  etatTache,
   etatFichiers,
   listerDocuments,
   reindexerIndex,
@@ -78,8 +79,16 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const projetEdit = projet ?? "demo";
 
   // Conversations (mode Chat) : historique multi-sessions, fil courant.
-  const sessions = useDiscussions((s) => s.sessions);
-  const activeId = useDiscussions((s) => s.activeId);
+  const toutesSessions = useDiscussions((s) => s.sessions);
+  const sessions = useMemo(
+    () => toutesSessions.filter((session) => session.mode === "chat"),
+    [toutesSessions],
+  );
+  const activeId = useDiscussions((s) => s.activeIds.chat);
+  const activeEditId = useDiscussions((s) => s.activeIds.edit);
+  const sessionEditHistorique = useDiscussions(
+    (s) => s.sessions.find((session) => session.id === s.activeIds.edit && session.mode === "edit") ?? null,
+  );
   const active = sessions.find((s) => s.id === activeId) ?? null;
 
   const [message, setMessage] = useState("");
@@ -106,6 +115,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [resultats, setResultats] = useState<ResultatFichier[]>([]);
   const [tachesOpenCode, setTachesOpenCode] = useState<TacheOpenCode[]>([]);
   const tacheCouranteRef = useRef<string | null>(null);
+  const repriseTacheRef = useRef<string | null>(null);
   const [tacheActive, setTacheActive] = useState(false);
   const [erreur, setErreur] = useState<{ code: string; message: string } | null>(null);
   const [erreurChat, setErreurChat] = useState<{ code: string; message: string } | null>(null);
@@ -116,6 +126,15 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const rechargerFichiers = useStudio((s) => s.rechargerFichiers);
   const ouvrirFichier = useStudio((s) => s.ouvrirFichier);
   const empreintesTacheRef = useRef<Record<string, string | null>>({});
+
+  // Quand on ouvre une ancienne session Edit, reprendre son identifiant
+  // backend permet de continuer la conversation au lieu d'en créer une autre.
+  useEffect(() => {
+    if (!enChat) {
+      setSessionEdit(sessionEditHistorique?.backend ?? null);
+      setMoteurEdit(sessionEditHistorique?.moteur ?? null);
+    }
+  }, [enChat, sessionEditHistorique?.backend, sessionEditHistorique?.moteur, sessionEditHistorique?.id]);
 
   // Suivi du bas de flux quand une réponse arrive.
   useEffect(() => {
@@ -162,6 +181,51 @@ export function ChatPanel({ projet }: ChatPanelProps) {
       window.clearInterval(timer);
     };
   }, [tacheActive, projet, onglets, rechargerFichiers]);
+
+  // Après un refresh, le backend peut encore exécuter la tâche. On restaure
+  // son journal SSE et on se rattache au flux sans relancer la consigne.
+  useEffect(() => {
+    if (enChat || executionEdit !== "autonome" || !projet || !activeEditId) return;
+    const projetReprise = projet;
+    const sessionReprise = activeEditId;
+    const cle = `${projetReprise}:${sessionReprise}`;
+    if (repriseTacheRef.current === cle) return;
+    repriseTacheRef.current = cle;
+    let vivant = true;
+
+    async function reprendre() {
+      try {
+        const etat = await etatTache(projetReprise, sessionReprise);
+        if (!vivant || !etat.existe) return;
+        const executionId = "reprise-" + sessionReprise;
+        const consigne =
+          etat.message ??
+          sessionEditHistorique?.messages.find((message) => message.role === "user")?.texte ??
+          "Tâche autonome";
+        setTachesOpenCode((taches) =>
+          taches.some((tache) => tache.id === executionId)
+            ? taches
+            : [...taches, { id: executionId, consigne, events: [] }],
+        );
+        const controller = new AbortController();
+        abortRef.current = controller;
+        await consommerFluxTache(
+          executionId,
+          sessionReprise,
+          tacheAgent(projetReprise, "", { session: sessionReprise, signal: controller.signal }),
+          controller,
+        );
+      } catch (error) {
+        if (vivant) setErreur({ code: "interne", message: error instanceof Error ? error.message : String(error) });
+      }
+    }
+
+    void reprendre();
+    return () => {
+      vivant = false;
+      abortRef.current?.abort();
+    };
+  }, [enChat, executionEdit, projet, activeEditId, sessionEditHistorique?.id]);
 
   // État des cours indexés (RAG), chargé à l'ouverture du menu « ＋ ».
   useEffect(() => {
@@ -257,7 +321,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
 
     const disc = useDiscussions.getState();
     let id = activeId;
-    if (!id) id = disc.nouvelle();
+    if (!id) id = disc.nouvelle("chat");
     disc.ajouterMessage(id, "user", consigne);
     disc.ajouterMessage(id, "assistant", "");
     const backendAvant =
@@ -303,6 +367,11 @@ export function ChatPanel({ projet }: ChatPanelProps) {
 
   // ── Mode EDIT : proposer (hunks) puis appliquer à la main ──
   async function envoyer() {
+    const consigne = message;
+    if (!consigne.trim() || busy || !projet) return;
+    const historique = useDiscussions.getState();
+    const sessionId = activeEditId ?? historique.nouvelle("edit");
+    historique.ajouterMessage(sessionId, "user", consigne);
     setBusy(true);
     setTexte([]);
     setProps([]);
@@ -313,7 +382,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     const controller = new AbortController();
     abortRef.current = controller;
     try {
-      for await (const evt of chatAgent(projetEdit, message, {
+      for await (const evt of chatAgent(projetEdit, consigne, {
         mode: "edit",
         session: sessionEdit,
         signal: controller.signal,
@@ -321,6 +390,11 @@ export function ChatPanel({ projet }: ChatPanelProps) {
         if (evt.event === "debut") {
           setSessionEdit(evt.data.session);
           setMoteurEdit(evt.data.moteur);
+          useDiscussions.getState().fixer(
+            sessionId,
+            evt.data.session ?? sessionEdit ?? sessionId,
+            evt.data.moteur,
+          );
         } else if (evt.event === "texte") {
           setTexte((t) => [...t, evt.data.delta]);
         } else if (evt.event === "proposition") {
@@ -333,6 +407,14 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           break;
         } else if (evt.event === "fin") {
           setSessionEdit(evt.data.session);
+          const moteurSession = useDiscussions
+            .getState()
+            .sessions.find((session) => session.id === sessionId)?.moteur;
+          useDiscussions.getState().fixer(
+            sessionId,
+            evt.data.session ?? sessionEdit ?? sessionId,
+            moteurSession ?? moteurEdit ?? "Roch",
+          );
         }
       }
     } catch (e) {
@@ -360,11 +442,74 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     }
   }
 
+  async function consommerFluxTache(
+    executionId: string,
+    sessionId: string,
+    flux: AsyncGenerator<EvenementTache>,
+    controller: AbortController,
+  ) {
+    setTacheActive(true);
+    setBusy(true);
+    try {
+      for await (const evt of flux) {
+        setTachesOpenCode((taches) =>
+          taches.map((tache) =>
+            tache.id === executionId
+              ? { ...tache, events: [...tache.events, evt] }
+              : tache,
+          ),
+        );
+        if (evt.event === "debut") {
+          setSessionEdit(evt.data.session);
+          setMoteurEdit(evt.data.moteur);
+          useDiscussions.getState().fixer(
+            sessionId,
+            evt.data.session ?? sessionId,
+            evt.data.moteur,
+          );
+        } else if (evt.event === "texte") {
+          setTexte((t) => [...t, evt.data.delta]);
+        } else if (evt.event === "erreur") {
+          setErreur({
+            code: evt.data.code,
+            message: evt.data.message || (ETIQUETTES_ERREUR[evt.data.code] ?? evt.data.code),
+          });
+          break;
+        } else if (evt.event === "fin") {
+          setSessionEdit(evt.data.session);
+          const moteurSession = useDiscussions
+            .getState()
+            .sessions.find((session) => session.id === sessionId)?.moteur;
+          useDiscussions.getState().fixer(
+            sessionId,
+            evt.data.session ?? sessionId,
+            moteurSession ?? moteurEdit ?? "Roch",
+          );
+        }
+      }
+      if (onglets.length) await rechargerFichiers(onglets.map((onglet) => onglet.chemin));
+    } catch (error) {
+      if (!controller.signal.aborted) {
+        setErreur({
+          code: "interne",
+          message: error instanceof Error ? error.message : String(error),
+        });
+      }
+    } finally {
+      setTacheActive(false);
+      setBusy(false);
+    }
+  }
+
   // Mode OpenCode réel : l'agent peut lire le projet, enchaîner plusieurs
   // outils et écrire directement plusieurs fichiers dans le dossier courant.
   async function envoyerAutonome() {
     const consigne = message;
     if (!consigne.trim() || busy || !projet) return;
+    const historique = useDiscussions.getState();
+    const sessionId = activeEditId ?? historique.nouvelle("edit");
+    repriseTacheRef.current = `${projet}:${sessionId}`;
+    historique.ajouterMessage(sessionId, "user", consigne);
     setBusy(true);
     setTacheActive(true);
     setTexte([]);
@@ -379,45 +524,15 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     const controller = new AbortController();
     abortRef.current = controller;
     setMessage("");
-    try {
-      for await (const evt of tacheAgent(projet, consigne, {
-        session: sessionEdit,
+    await consommerFluxTache(
+      executionId,
+      sessionId,
+      tacheAgent(projet, consigne, {
+        session: sessionId,
         signal: controller.signal,
-      })) {
-        setTachesOpenCode((taches) =>
-          taches.map((tache) =>
-            tache.id === executionId
-              ? { ...tache, events: [...tache.events, evt] }
-              : tache,
-          ),
-        );
-        if (evt.event === "debut") {
-          setSessionEdit(evt.data.session);
-          setMoteurEdit(evt.data.moteur);
-        } else if (evt.event === "texte") {
-          setTexte((t) => [...t, evt.data.delta]);
-        } else if (evt.event === "erreur") {
-          setErreur({
-            code: evt.data.code,
-            message: evt.data.message || (ETIQUETTES_ERREUR[evt.data.code] ?? evt.data.code),
-          });
-          break;
-        } else if (evt.event === "fin") {
-          setSessionEdit(evt.data.session);
-        }
-      }
-      if (onglets.length) await rechargerFichiers(onglets.map((o) => o.chemin));
-    } catch (e) {
-      if (!controller.signal.aborted) {
-        setErreur({
-          code: "interne",
-          message: e instanceof Error ? e.message : String(e),
-        });
-      }
-    } finally {
-      setTacheActive(false);
-      setBusy(false);
-    }
+      }),
+      controller,
+    );
   }
 
   function basculer(fichier: string, idHunk: number) {
@@ -604,22 +719,20 @@ export function ChatPanel({ projet }: ChatPanelProps) {
                 ))}
             </div>
           ))}
-        {busy && !enChat && (
-          <div className="chat-busy">
-            {executionEdit === "autonome"
-              ? (() => {
-                  const derniereTache = tachesOpenCode[tachesOpenCode.length - 1];
-                  const activites = derniereTache?.events.filter(
-                    (evt): evt is Extract<EvenementTache, { event: "activite" }> =>
-                      evt.event === "activite" && evt.data.status === "running",
-                  );
-                  const activite = activites?.[activites.length - 1];
-                  return activite
-                    ? `… ${activite.data.title}${activite.data.description ? " — " + activite.data.description : ""}`
-                    : "… Roch analyse le projet";
-                })()
-              : "… l'agent propose — tu peux entre-temps éditer"}
-          </div>
+        {busy && !enChat && executionEdit === "autonome" &&
+          (() => {
+            const derniereTache = tachesOpenCode[tachesOpenCode.length - 1];
+            const activites = derniereTache?.events.filter(
+              (evt): evt is Extract<EvenementTache, { event: "activite" }> =>
+                evt.event === "activite" && evt.data.status === "running",
+            );
+            // La timeline affiche déjà l'activité en cours : ne pas la
+            // répéter dans un deuxième bandeau identique.
+            if (activites?.length) return null;
+            return <div className="chat-busy">… Roch analyse le projet</div>;
+          })()}
+        {busy && !enChat && executionEdit !== "autonome" && (
+          <div className="chat-busy">… l'agent propose — tu peux entre-temps éditer</div>
         )}
         {!enChat &&
           props.map((p) => {

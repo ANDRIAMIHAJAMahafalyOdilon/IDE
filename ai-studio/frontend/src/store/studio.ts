@@ -24,8 +24,7 @@ interface EtatStudio {
   projection: Record<string, string>;
   dirty: Record<string, boolean>;
   erreur: string | null;
-  /** Mode courant du panneau agent : drive aussi la colonne gauche
-   *  (historique des conversations en `chat`, explorateur en `edit`). */
+  /** Mode courant du panneau agent : drive aussi la liste historique séparée. */
   modeAgent: ModeAgent;
   setModeAgent: (mode: ModeAgent) => void;
   chargerProjets: () => Promise<void>;

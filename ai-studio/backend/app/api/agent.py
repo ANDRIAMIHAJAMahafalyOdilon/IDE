@@ -8,8 +8,11 @@ fermeture silencieuse. Séquence prévisible :
 
 from __future__ import annotations
 
+import asyncio
 import json
+import hashlib
 import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -22,17 +25,34 @@ from ..services import (
     opencode, workspace,
 )
 from ..services.diff import ErreurDiff
+from ..config import MEMOIRE_DIR
 
 router = APIRouter(prefix="/api/agent", tags=["agent"])
 
 # Mémoire de session, indexée par (mode, id logique) : les fils « chat » et
 # « edit » sont ISOLÉS (le bavardage général ne doit jamais polluer le prompt
-# d'édition, ni l'inverse). Sessions OpenCode réutilisées par projet.
+# d'édition, ni l'inverse). Les sessions OpenCode sont propres à chaque fil.
 _MEMOIRE: dict[tuple[str, str], list[dict[str, Any]]] = {}
-_SESSIONS_OPENCODE: dict[str, str] = {}
-# Sessions OpenCode du MODE AUTONOME : la conversation vit du côté OpenCode,
-# on la "forke" à chaque tâche pour garder la continuité du projet.
-_SESSIONS_TACHE: dict[str, str] = {}
+_SESSIONS_OPENCODE: dict[tuple[str, str], str] = {}
+# Sessions OpenCode du MODE AUTONOME : la conversation vit du côté OpenCode et
+# est reprise par le jeton stable du fil frontend.
+_SESSIONS_TACHE: dict[tuple[str, str], str] = {}
+
+
+@dataclass
+class EtatTache:
+    """État d'une tâche indépendant de la connexion SSE du navigateur."""
+
+    projet: str
+    session: str
+    message: str
+    evenements: list[tuple[str, dict[str, Any]]] = field(default_factory=list)
+    terminee: bool = False
+    condition: asyncio.Condition = field(default_factory=asyncio.Condition)
+    travail: asyncio.Task[None] | None = None
+
+
+_TACHES: dict[tuple[str, str], EtatTache] = {}
 
 
 def _evt(nom: str, data: dict[str, Any]) -> dict[str, str]:
@@ -45,14 +65,44 @@ def _err(code: str, message: str, fichier: str | None = None) -> dict[str, str]:
 
 def _memoire(mode: str, sid: str) -> list[dict[str, Any]]:
     """Mémoire du fil (mode, session) — créée à la demande."""
-    return _MEMOIRE.setdefault((mode, sid), [])
+    cle = (mode, sid)
+    if cle in _MEMOIRE:
+        return _MEMOIRE[cle]
+    nom = hashlib.sha256(f"{mode}:{sid}".encode("utf-8")).hexdigest() + ".json"
+    chemin = MEMOIRE_DIR / nom
+    memoire: list[dict[str, Any]] = []
+    try:
+        valeur = json.loads(chemin.read_text(encoding="utf-8"))
+        if isinstance(valeur, list):
+            memoire = [x for x in valeur if isinstance(x, dict)][-40:]
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        pass
+    _MEMOIRE[cle] = memoire
+    return memoire
+
+
+def _sauver_memoire(mode: str, sid: str, memoire: list[dict[str, Any]]) -> None:
+    """Sauvegarde atomique du fil pour survivre aux redémarrages backend."""
+    nom = hashlib.sha256(f"{mode}:{sid}".encode("utf-8")).hexdigest() + ".json"
+    chemin = MEMOIRE_DIR / nom
+    temporaire = chemin.with_suffix(".tmp")
+    try:
+        MEMOIRE_DIR.mkdir(parents=True, exist_ok=True)
+        temporaire.write_text(
+            json.dumps(memoire[-40:], ensure_ascii=False), encoding="utf-8"
+        )
+        temporaire.replace(chemin)
+    except OSError:
+        # La mémoire RAM reste active si le dossier de données est momentanément
+        # indisponible (droits, disque amovible, etc.).
+        pass
 
 
 def _session_id(mode: str, lié: str | None) -> str:
-    if lié and (mode, lié) in _MEMOIRE:
-        return lié
     sid = lié or f"sess-{uuid.uuid4().hex[:8]}"
-    _MEMOIRE.setdefault((mode, sid), [])
+    # Passe par le chargeur durable : après un redémarrage backend, un session
+    # id déjà connu ne doit pas repartir avec une mémoire vide.
+    _memoire(mode, sid)
     return sid
 
 
@@ -133,6 +183,7 @@ async def generer_discussion(req: RequeteChat) -> Any:
 
     memoire.append({"question": req.message, "reponse": "".join(morceaux)})
     del memoire[:-20]
+    _sauver_memoire("chat", session, memoire)
     yield _evt("fin", {"session": session, "nb_fichiers": 0})
 
 
@@ -155,10 +206,11 @@ async def generer_evenements(req: RequeteChat, racine: Path) -> Any:
 
         # ── Moteur réel : session OpenCode réutilisée (proposeur seul) ──
         try:
-            sid = _SESSIONS_OPENCODE.get(req.projet)
+            cle_session = (req.projet, session)
+            sid = _SESSIONS_OPENCODE.get(cle_session)
             if not sid:
                 sid = opencode.creer_session(racine)
-                _SESSIONS_OPENCODE[req.projet] = sid
+                _SESSIONS_OPENCODE[cle_session] = sid
         except opencode.ErreurOpenCode:
             sid = None  # le fallback Gemini/Groq prend le relais
 
@@ -189,6 +241,7 @@ async def generer_evenements(req: RequeteChat, racine: Path) -> Any:
             "reponse": resultat["texte_resume"],
         })
         del _memoire("edit", session)[:-20]
+        _sauver_memoire("edit", session, _memoire("edit", session))
         yield _evt(
             "fin",
             {"session": session, "nb_fichiers": len(resultat["propositions"])},
@@ -214,13 +267,110 @@ async def tache(req: RequeteTache) -> EventSourceResponse:
     comme lorsqu'il est lancé depuis un terminal.
     """
     racine = workspace.projet_existant(req.projet)
-    return EventSourceResponse(generer_tache(req, racine))
+    session = req.session or f"tache-{uuid.uuid4().hex[:12]}"
+    cle = (req.projet, session)
+    etat = _TACHES.get(cle)
+
+    # Un refresh renvoie une consigne vide : on se rattache à la tâche déjà
+    # présente et on rejoue son journal. Une nouvelle consigne après une tâche
+    # terminée ouvre naturellement un nouveau tour dans la même session.
+    if etat is None or (etat.terminee and req.message.strip()):
+        if not req.message.strip():
+            return EventSourceResponse(_flux_tache_absent())
+        etat = EtatTache(req.projet, session, req.message)
+        _TACHES[cle] = etat
+        etat.travail = asyncio.create_task(_executer_tache(etat, racine))
+    return EventSourceResponse(_flux_tache(etat))
+
+
+async def _flux_tache_absent() -> Any:
+    yield _err("tache_introuvable", "Aucune tâche autonome à reprendre.")
+
+
+async def _ajouter_evenement_tache(
+    etat: EtatTache, nom: str, data: dict[str, Any]
+) -> None:
+    data = dict(data)
+    if nom in ("debut", "fin") and data.get("session"):
+        _SESSIONS_TACHE[(etat.projet, etat.session)] = str(data["session"])
+        # Le frontend garde ce jeton stable ; l'identifiant OpenCode réel reste
+        # uniquement dans le backend pour la reprise du prochain tour.
+        data["session"] = etat.session
+    async with etat.condition:
+        etat.evenements.append((nom, data))
+        etat.condition.notify_all()
+
+
+async def _executer_tache(etat: EtatTache, racine: Path) -> None:
+    try:
+        sid_opencode = _SESSIONS_TACHE.get((etat.projet, etat.session))
+        async for nom, data in agent_tache.executer_tache(
+            racine, etat.message, sid_opencode=sid_opencode
+        ):
+            await _ajouter_evenement_tache(etat, nom, data)
+        memoire = _memoire("tache", etat.session)
+        memoire.append(
+            {"question": etat.message, "reponse": "tâche exécutée (mode autonome)"}
+        )
+        _sauver_memoire("tache", etat.session, memoire)
+    except agent_tache.ErreurTache as exc:
+        await _ajouter_evenement_tache(etat, "erreur", {
+            "code": exc.code,
+            "message": exc.message,
+            "fichier": None,
+        })
+    except workspace.CheminHorsProjet as exc:
+        await _ajouter_evenement_tache(etat, "erreur", {
+            "code": "hors_projet",
+            "message": str(exc),
+            "fichier": None,
+        })
+    except Exception as exc:  # noqa: BLE001 — garde-fou du travail détaché
+        await _ajouter_evenement_tache(etat, "erreur", {
+            "code": "interne",
+            "message": f"Erreur interne du backend : {exc}",
+            "fichier": None,
+        })
+    finally:
+        async with etat.condition:
+            etat.terminee = True
+            etat.condition.notify_all()
+
+
+async def _flux_tache(etat: EtatTache) -> Any:
+    index = 0
+    while True:
+        while index < len(etat.evenements):
+            nom, data = etat.evenements[index]
+            index += 1
+            yield _evt(nom, data)
+        if etat.terminee:
+            return
+        async with etat.condition:
+            if index >= len(etat.evenements) and not etat.terminee:
+                await etat.condition.wait()
+
+
+@router.get("/tache/status")
+async def tache_status(projet: str, session: str):
+    etat = _TACHES.get((projet, session))
+    if etat is None:
+        return {"existe": False, "active": False, "terminee": False}
+    return {
+        "existe": True,
+        "active": not etat.terminee,
+        "terminee": etat.terminee,
+        "message": etat.message,
+    }
 
 
 @router.post("/tache/abort")
 async def tache_abort(req: RequeteTacheControle):
     """Interrompt réellement la session OpenCode du projet."""
-    sid = _SESSIONS_TACHE.get(req.projet)
+    sid = next(
+        (session for (projet, _), session in _SESSIONS_TACHE.items() if projet == req.projet),
+        None,
+    )
     if not sid:
         return {"ok": True, "interrompue": False}
     try:
@@ -243,33 +393,6 @@ async def tache_permission(req: RequetePermission):
         raise HTTPException(status_code=400, detail=exc.message) from exc
     except workspace.CheminHorsProjet as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-
-
-async def generer_tache(req: RequeteTache, racine: Path) -> Any:
-    """Événementiel du mode autonomie (sortie directe asyncio, comme le chat)."""
-    try:
-        sid_opencode = None
-        try:
-            sid_opencode = _SESSIONS_TACHE.get(req.projet)
-        except Exception:  # noqa: BLE001 — jamais bloquant en lecture
-            pass
-        async for nom, data in agent_tache.executer_tache(
-            racine, req.message, sid_opencode=sid_opencode
-        ):
-            # Persistance de la session complète (fork suivant) ; affichage court.
-            if nom in ("debut", "fin") and data.get("session"):
-                _SESSIONS_TACHE[req.projet] = data["session"]
-                data["session"] = str(data["session"])[:8]
-            yield _evt(nom, data)
-        _memoire("tache", req.session or req.projet).append(
-            {"question": req.message, "reponse": "tâche exécutée (mode autonome)"}
-        )
-    except agent_tache.ErreurTache as exc:
-        yield _err(exc.code, exc.message)
-    except workspace.CheminHorsProjet as exc:
-        yield _err("hors_projet", str(exc))
-    except Exception as exc:  # noqa: BLE001 — garde-fou : jamais de fermeture muette
-        yield _err("interne", f"Erreur interne du backend : {exc}")
 
 
 @router.post("/apply-changes")

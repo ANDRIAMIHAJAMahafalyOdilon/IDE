@@ -41,7 +41,9 @@ def appliquer_changements(
     modifications: Sequence[Mapping[str, Any]],
 ) -> list[ResultatFichier]:
     """Applique chaque changement dict {fichier, action, source_hash, acceptes}."""
-    return [_appliquer_un(racine, m) for m in modifications]
+    resultats = [_appliquer_un(racine, m) for m in modifications]
+    workspace.invalider_arborescence(racine)
+    return resultats
 
 
 def _appliquer_un(racine: Path, m: Mapping[str, Any]) -> ResultatFichier:

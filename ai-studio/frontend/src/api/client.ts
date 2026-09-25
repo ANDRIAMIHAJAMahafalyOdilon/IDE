@@ -109,6 +109,23 @@ export async function* tacheAgent(
   }
 }
 
+export interface EtatTachePersistante {
+  existe: boolean;
+  active: boolean;
+  terminee: boolean;
+  message?: string;
+}
+
+export async function etatTache(
+  projet: string,
+  session: string,
+): Promise<EtatTachePersistante> {
+  const params = new URLSearchParams({ projet, session });
+  const res = await fetch(`/api/agent/tache/status?${params.toString()}`);
+  if (!res.ok) throw new Error("status tâche " + res.status);
+  return (await res.json()) as EtatTachePersistante;
+}
+
 export async function arreterTache(projet: string): Promise<void> {
   const res = await fetch("/api/agent/tache/abort", {
     method: "POST",

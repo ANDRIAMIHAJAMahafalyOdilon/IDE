@@ -6,15 +6,24 @@ avec une vérification anti "path traversal" : impossible de sortir du projet.
 
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
-from ..config import FICHIER_CONTEXTE_MAX_CAR, FICHIERS_CONTEXTE_MAX, PROJETS_DIR
+from ..config import (
+    ARBORESCENCE_CACHE_SECONDES,
+    FICHIER_CONTEXTE_MAX_CAR,
+    FICHIERS_CONTEXTE_MAX,
+    PROJETS_DIR,
+)
 from . import registre
 from .filtres import filtres_pour
 
 
 class CheminHorsProjet(ValueError):
     """Levée quand un chemin relatif tente de sortir du dossier racine."""
+
+
+_ARBORESCENCES: dict[tuple[str, int], tuple[float, str]] = {}
 
 
 def _racine_importee(nom: str, creer: bool) -> Path:
@@ -91,15 +100,33 @@ def lister_arborescence(racine: Path) -> list[str]:
 
 def arborescence_texte(racine: Path, limite: int = 200) -> str:
     """Représentation compacte du projet pour le contexte de l'agent."""
+    cle = (str(racine.resolve()), limite)
+    maintenant = time.monotonic()
+    cache = _ARBORESCENCES.get(cle)
+    if cache and maintenant - cache[0] < ARBORESCENCE_CACHE_SECONDES:
+        return cache[1]
     fichiers = lister_arborescence(racine)
     if not fichiers:
-        return "(projet vide)"
-    if len(fichiers) > limite:
-        affiches = fichiers[:limite]
-        extra = f"\n… +{len(fichiers) - limite} fichiers"
+        texte = "(projet vide)"
     else:
-        affiches, extra = fichiers, ""
-    return "\n".join(affiches) + extra
+        if len(fichiers) > limite:
+            affiches = fichiers[:limite]
+            extra = f"\n… +{len(fichiers) - limite} fichiers"
+        else:
+            affiches, extra = fichiers, ""
+        texte = "\n".join(affiches) + extra
+    _ARBORESCENCES[cle] = (maintenant, texte)
+    return texte
+
+
+def invalider_arborescence(racine: Path | None = None) -> None:
+    """Invalide le cache après une création ou suppression de fichier."""
+    if racine is None:
+        _ARBORESCENCES.clear()
+        return
+    prefixe = str(racine.resolve())
+    for cle in [cle for cle in _ARBORESCENCES if cle[0] == prefixe]:
+        _ARBORESCENCES.pop(cle, None)
 
 
 def bloc_fichiers_contexte(

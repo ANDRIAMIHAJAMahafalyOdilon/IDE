@@ -7,6 +7,7 @@ Exécutables sans réseau, sans clé LLM et sans serveur OpenCode :
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import pathlib
 import sys
@@ -179,6 +180,8 @@ def test_generer_discussion_debut_texte_fin_sans_proposition():
     finally:
         agent_discussion.demarrer_reponse = sauv
         agent._MEMOIRE.pop(("chat", "sess-chat-test"), None)
+        nom = hashlib.sha256(b"chat:sess-chat-test").hexdigest() + ".json"
+        (agent.MEMOIRE_DIR / nom).unlink(missing_ok=True)
 
 
 def test_generer_discussion_erreur_moteur():
@@ -218,6 +221,25 @@ def test_sessions_isolatees_par_mode():
     assert agent._memoire("chat", sid_chat) != []
     assert agent._memoire("edit", sid_edit) == []  # aucun mélange de fils
     agent._MEMOIRE.clear()
+
+
+def test_memoire_rechargee_apres_redemarrage_backend():
+    sid = "sess-persist-test"
+    ancienne = agent._MEMOIRE.pop(("chat", sid), None)
+    memoire = agent._memoire("chat", sid)
+    memoire.clear()
+    memoire.append({"question": "à retenir", "reponse": "réponse"})
+    agent._sauver_memoire("chat", sid, memoire)
+    agent._MEMOIRE.pop(("chat", sid), None)
+    try:
+        assert agent._session_id("chat", sid) == sid
+        assert agent._memoire("chat", sid)[-1]["question"] == "à retenir"
+    finally:
+        agent._MEMOIRE.pop(("chat", sid), None)
+        nom = hashlib.sha256(f"chat:{sid}".encode("utf-8")).hexdigest() + ".json"
+        (agent.MEMOIRE_DIR / nom).unlink(missing_ok=True)
+        if ancienne is not None:
+            agent._MEMOIRE[("chat", sid)] = ancienne
 
 
 # ────────────────────────────────────────────────────────────────────────────

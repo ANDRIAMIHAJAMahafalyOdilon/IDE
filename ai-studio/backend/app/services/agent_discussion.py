@@ -63,7 +63,15 @@ def _tronquer_prioritaire(
     gardes: list[tuple[str, str]] = []
     for etiquette, texte in blocs:
         if len(texte) > budget:
-            gardes.append((etiquette, texte[:budget]))
+            # La fin contient les échanges les plus récents. Garder le début
+            # faisait disparaître la dernière question lorsque le budget était
+            # atteint.
+            if etiquette.lower() == "mémoire":
+                gardes.append(
+                    (etiquette, "[…anciens échanges omis…]\n" + texte[-max(0, budget - 26):])
+                )
+            else:
+                gardes.append((etiquette, texte[:budget]))
             break
         gardes.append((etiquette, texte))
         budget -= len(texte)

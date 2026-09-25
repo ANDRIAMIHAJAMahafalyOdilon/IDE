@@ -337,10 +337,10 @@ def test_tache_consigne_vide():
         raise AssertionError("ErreurTache attendue pour une consigne vide")
 
 
-def test_commande_inclut_fork_session():
+def test_commande_reprend_session_sans_fork():
     cmd = at._commande("opencode.exe", pathlib.Path("C:/p"), "consigne", "sess-111")
     assert cmd[:6] == ["opencode.exe", "run", "--format", "json", "--auto", "--dir"]
-    assert "-s" in cmd and "sess-111" in cmd and "--fork" in cmd
+    assert "-s" in cmd and "sess-111" in cmd and "--fork" not in cmd
     assert "--model" in cmd and at.OPENCODE_MODEL in cmd
     assert cmd[-1] == "consigne"
 
