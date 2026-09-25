@@ -2,7 +2,17 @@ venv/
 __pycache__/
 *.pyc
 .env
-index/
-*.egg-info/
 dist/
 build/
+*.egg-info/
+*.tsbuildinfo
+node_modules/
+logs/
+*.log
+
+# Documents de cours et index RAG : fichiers volumineux/privés, non versionnés.
+ai-studio/data/documents/
+ai-studio/data/index/
+ai-studio/archive/
+ai-studio/data/organizer.db
+ai-studio/data/registre.json

@@ -1,0 +1,1 @@
+"""AI Studio — backend (API FastAPI). Package racine."""

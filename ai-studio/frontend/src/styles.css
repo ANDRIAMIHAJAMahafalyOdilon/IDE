@@ -1,0 +1,533 @@
+:root {
+  /* Palette sombre monochrome (accent = noir/blanc, aucun ton froid).
+     Référence : look VS Code, déclinaison gris pur. */
+  --bg-0: #1e1e1e; /* éditeur / fond racine */
+  --bg-1: #252526; /* sidebar, chat, toolbars */
+  --bg-2: #2d2d2d; /* bande d'onglets, entête de hunk */
+  --bg-3: #37373d; /* survol */
+  --bg-4: #3c3c3c; /* champs de saisie */
+  --bg-5: #454550; /* survol saisie */
+  --line-1: #1a1a1a; /* séparateurs */
+  --line-2: #3c3c3c; /* bordures visibles */
+  --text-1: #e0e0e0;
+  --text-2: #c2c2c2;
+  --text-3: #9a9a9a;
+  --text-4: #6a6a6a;
+  --accent: #e0e0e0; /* accent monochrome : blanc */
+  --accent-bg: #444444; /* surfaces accentuées */
+  --ok: #8bc34a;
+  --ko: #ff7b72;
+  --on-accent: #1b1b1b;
+  --scroll-thumb: #4a4a4a;
+  --scroll-thumb-hover: #5a5a5a;
+  --surface-code: #1a1a1a;
+  --code-text: #d4d4d4;
+  --terminal-bg: #17191d;
+  --terminal-pre-bg: #14171a;
+  --danger-bg: #2a1a1a;
+  --danger-border: #5a2d2d;
+  --permission-bg: #302718;
+  --permission-border: #d9a441;
+  --success-bg: #2e7d32;
+  --success-text: #eaffea;
+  --success-hover: #3c9a42;
+  --stop-bg: #7d3434;
+  --stop-text: #ffe8e8;
+  --stop-hover: #a34747;
+  --action-write-bg: #2a2f26;
+  --action-write-text: #b8cc9a;
+  --action-delete-bg: #3a2727;
+  --action-delete-text: #d49a9a;
+  --diff-add-bg: #22351f;
+  --diff-add-text: #a8d69a;
+  --diff-del-bg: #3a2121;
+  --diff-del-text: #e2a3a3;
+  --shadow: rgba(0, 0, 0, 0.35);
+  --shadow-strong: rgba(0, 0, 0, 0.45);
+}
+
+.theme-clair {
+  --bg-0: #f5f5f5;
+  --bg-1: #ffffff;
+  --bg-2: #eeeeee;
+  --bg-3: #e2e2e2;
+  --bg-4: #fafafa;
+  --bg-5: #e7e7e7;
+  --line-1: #dedede;
+  --line-2: #c8c8c8;
+  --text-1: #202020;
+  --text-2: #3d3d3d;
+  --text-3: #666666;
+  --text-4: #888888;
+  --accent: #202020;
+  --accent-bg: #dedede;
+  --ok: #398a28;
+  --ko: #c33d36;
+  --on-accent: #ffffff;
+  --scroll-thumb: #b8b8b8;
+  --scroll-thumb-hover: #999999;
+  --surface-code: #f0f0f0;
+  --code-text: #252525;
+  --terminal-bg: #f0f0f0;
+  --terminal-pre-bg: #fafafa;
+  --danger-bg: #fff1f0;
+  --danger-border: #e0aaa5;
+  --permission-bg: #fff7df;
+  --permission-border: #c49532;
+  --success-bg: #dff3df;
+  --success-text: #215f28;
+  --success-hover: #c9e8c9;
+  --stop-bg: #f3d8d8;
+  --stop-text: #7d2929;
+  --stop-hover: #e9bcbc;
+  --action-write-bg: #e5f1e1;
+  --action-write-text: #2e6528;
+  --action-delete-bg: #fae4e2;
+  --action-delete-text: #963b36;
+  --diff-add-bg: #e2f3df;
+  --diff-add-text: #286b2c;
+  --diff-del-bg: #fae3e2;
+  --diff-del-text: #a33a35;
+  --shadow: rgba(0, 0, 0, 0.14);
+  --shadow-strong: rgba(0, 0, 0, 0.22);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--bg-0);
+  color: var(--text-1);
+  font-family: "Segoe UI", system-ui, -apple-system, sans-serif;
+  font-size: 13px;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--scroll-thumb);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+  border-radius: 6px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--scroll-thumb-hover);
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+button,
+input,
+select {
+  font-family: inherit;
+}
+
+/* ── Colonne latérale (historique) ────────────────────────────── */
+
+.sidebar-header {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px 8px;
+  border-bottom: 1px solid var(--line-2);
+}
+
+.logo {
+  width: 18px;
+  height: 18px;
+  border: 2px solid var(--text-1);
+  border-radius: 4px;
+  position: relative;
+}
+
+.logo::after {
+  content: "";
+  position: absolute;
+  inset: 3px;
+  border-radius: 2px;
+  background: var(--text-1);
+}
+
+.sidebar-brand {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-1);
+}
+
+.rien {
+  color: var(--text-4);
+  font-size: 12px;
+  padding: 4px;
+}
+
+/* ── Historique des conversations (mode Chat, esprit Claude.ai) ── */
+
+.historique {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  overflow-y: auto;
+  font-size: 13px;
+}
+
+.historique-nouveau {
+  width: 100%;
+  height: 30px;
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: 4px;
+  font-weight: 600;
+  cursor: pointer;
+  text-align: left;
+  padding: 0 10px;
+}
+
+.historique-nouveau:hover {
+  background: #ffffff;
+}
+
+.historique-liste {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.historique-ligne {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  border-radius: 4px;
+  padding: 2px 2px 2px 6px;
+}
+
+.historique-ligne:hover {
+  background: var(--bg-3);
+}
+
+.historique-ligne.actif {
+  background: var(--bg-3);
+  border-left: 2px solid var(--accent);
+  padding-left: 4px;
+}
+
+.historique-titre {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text-2);
+  font-size: 13px;
+  padding: 4px 2px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.historique-titre:hover {
+  color: var(--text-1);
+}
+
+.historique-ligne.actif .historique-titre {
+  color: var(--text-1);
+}
+
+.historique-actions {
+  display: none;
+  gap: 2px;
+  flex-shrink: 0;
+}
+
+.historique-ligne:hover .historique-actions {
+  display: flex;
+}
+
+.historique-actions button {
+  width: 22px;
+  height: 22px;
+  background: transparent;
+  border: none;
+  color: var(--text-4);
+  border-radius: 3px;
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.historique-actions button:hover:not(:disabled) {
+  background: var(--bg-4);
+  color: var(--text-1);
+}
+
+.historique-actions button:disabled {
+  opacity: 0.35;
+  cursor: default;
+}
+
+.historique-rename {
+  flex: 1;
+  min-width: 0;
+  height: 26px;
+  background: var(--bg-0);
+  color: var(--text-1);
+  border: 1px solid var(--accent);
+  border-radius: 3px;
+  padding: 0 6px;
+  outline: none;
+  font-size: 13px;
+}
+
+/* ── Interface dépouillée façon ChatGPT/Codex (pas un IDE) ── */
+
+.coda {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.coda-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 14px;
+  background: var(--bg-1);
+  border-bottom: 1px solid var(--line-1);
+  flex-wrap: wrap;
+}
+
+.theme-toggle {
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--line-2);
+  border-radius: 4px;
+  background: var(--bg-2);
+  color: var(--text-1);
+  cursor: pointer;
+  font-size: 11px;
+}
+
+.theme-toggle:hover {
+  background: var(--bg-3);
+}
+
+.coda-brand {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--text-1);
+  white-space: nowrap;
+}
+
+.coda-corps {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+}
+
+.coda-sidebar {
+  width: 260px;
+  flex-shrink: 0;
+  background: var(--bg-1);
+  border-right: 1px solid var(--line-1);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.coda-chat {
+  flex: 1;
+  min-width: 0;
+  background: var(--bg-0);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
+/* Sélecteur de projet / actions d'entête */
+.pj {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.pj-select {
+  flex: 0 1 340px;
+  min-width: 160px;
+  height: 28px;
+  background: var(--bg-4);
+  color: var(--text-1);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  padding: 0 6px;
+  outline: none;
+}
+
+.pj-select:focus {
+  border-color: var(--accent);
+}
+
+.pj-erreur {
+  font-size: 11px;
+  color: var(--ko);
+}
+
+/* Explorateur de dossier serveur (bouton « ＋ » du composeur edit) — panneau overlay. */
+.pj-explorateur {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+/* Dans le menu du composeur : statique, pleine largeur (pas d'overlay). */
+.composer-menu-dossier .pj-explorateur {
+  width: 100%;
+}
+
+.composer-menu-dossier .pj-explorateur-liste {
+  max-height: 250px;
+}
+
+.pj-explorateur-saisie {
+  display: flex;
+  gap: 4px;
+  flex: 0 0 auto;
+}
+
+.pj-explorateur-champ {
+  flex: 1;
+  min-width: 0;
+  height: 24px;
+  background: var(--bg-4);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  color: var(--text-1);
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  padding: 0 6px;
+  outline: none;
+}
+
+.pj-explorateur-champ:focus {
+  border-color: var(--accent);
+}
+
+.pj-explorateur-contexte {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+.pj-explorateur-chemin {
+  flex: 1;
+  min-width: 0;
+  font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
+  font-size: 11px;
+  color: var(--text-2);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pj-bouton-petit {
+  height: 24px;
+  min-width: 24px;
+  background: var(--bg-4);
+  color: var(--text-1);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pj-bouton-petit:hover:not(:disabled) {
+  background: var(--bg-5);
+}
+
+.pj-bouton-petit:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.pj-explorateur-vide {
+  font-size: 11px;
+  color: var(--text-3);
+  padding: 8px 4px;
+  text-align: center;
+}
+
+.pj-explorateur-liste {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  overflow: auto;
+  flex: 1 1 auto;
+}
+
+.pj-explorateur-liste li + li {
+  margin-top: 2px;
+}
+
+.pj-explorateur-dossier {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: 3px;
+  padding: 4px 6px;
+  color: var(--text-1);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.pj-explorateur-dossier:hover {
+  background: var(--bg-2);
+}
+
+/* Bouton final « Choisir ce dossier » : uniquement présent quand un dossier
+   est courant (chemin non vide → jamais de 422 open-local). */
+.pj-choisir {
+  flex: 0 0 auto;
+  width: 100%;
+  height: 26px;
+  background: var(--accent);
+  color: var(--on-accent);
+  border: none;
+  border-radius: 4px;
+  font-weight: 600;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pj-choisir:hover {
+  background: #ffffff;
+}
