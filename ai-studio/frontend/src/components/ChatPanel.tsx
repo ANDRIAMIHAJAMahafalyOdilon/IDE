@@ -115,6 +115,8 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [resultats, setResultats] = useState<ResultatFichier[]>([]);
   const [tachesOpenCode, setTachesOpenCode] = useState<TacheOpenCode[]>([]);
   const tacheCouranteRef = useRef<string | null>(null);
+  const lancementAutonomeRef = useRef(false);
+  const tacheSessionRef = useRef<string | null>(null);
   const repriseTacheRef = useRef<string | null>(null);
   const [tacheActive, setTacheActive] = useState(false);
   const [erreur, setErreur] = useState<{ code: string; message: string } | null>(null);
@@ -122,19 +124,36 @@ export function ChatPanel({ projet }: ChatPanelProps) {
 
   const enChat = modeAgent === "chat";
   const moteurAff = enChat ? (active?.moteur ?? null) : moteurEdit;
+  const messagesEdit = sessionEditHistorique?.messages ?? [];
+  const tacheLocaleVisible = !enChat && executionEdit === "autonome" && tachesOpenCode.length > 0;
+  const messagesEditVisibles = tacheLocaleVisible
+    ? messagesEdit.slice(0, -(messagesEdit.at(-1)?.role === "assistant" ? 2 : 1))
+    : messagesEdit;
   const onglets = useStudio((s) => s.onglets);
   const rechargerFichiers = useStudio((s) => s.rechargerFichiers);
   const ouvrirFichier = useStudio((s) => s.ouvrirFichier);
   const empreintesTacheRef = useRef<Record<string, string | null>>({});
 
-  // Quand on ouvre une ancienne session Edit, reprendre son identifiant
-  // backend permet de continuer la conversation au lieu d'en créer une autre.
+  // Quand on ouvre une session Edit, réaligner tout l'état local sur cette
+  // session. Les activités SSE ne doivent jamais rester visibles d'un autre fil.
   useEffect(() => {
-    if (!enChat) {
-      setSessionEdit(sessionEditHistorique?.backend ?? null);
-      setMoteurEdit(sessionEditHistorique?.moteur ?? null);
-    }
-  }, [enChat, sessionEditHistorique?.backend, sessionEditHistorique?.moteur, sessionEditHistorique?.id]);
+    if (enChat) return;
+    // Une nouvelle tâche vient juste de créer sa session : ne pas effacer
+    // son flux local au rerender qui suit `nouvelle("edit")`.
+    if (tacheSessionRef.current === activeEditId) return;
+    tacheSessionRef.current = null;
+    repriseTacheRef.current = null;
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setSessionEdit(sessionEditHistorique?.backend ?? null);
+    setMoteurEdit(sessionEditHistorique?.moteur ?? null);
+    setTachesOpenCode([]);
+    setTexte([]);
+    setProps([]);
+    setAcceptes(new Map());
+    setResultats([]);
+    setErreur(null);
+  }, [enChat, activeEditId]);
 
   // Suivi du bas de flux quand une réponse arrive.
   useEffect(() => {
@@ -143,6 +162,8 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   }, [
     active?.messages.length,
     active?.messages[active.messages.length - 1]?.texte.length,
+    messagesEditVisibles.length,
+    messagesEditVisibles[messagesEditVisibles.length - 1]?.texte.length,
     tachesOpenCode[tachesOpenCode.length - 1]?.events.length,
     busy,
   ]);
@@ -381,6 +402,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
+    let resume = "";
     try {
       for await (const evt of chatAgent(projetEdit, consigne, {
         mode: "edit",
@@ -396,6 +418,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             evt.data.moteur,
           );
         } else if (evt.event === "texte") {
+          resume += evt.data.delta;
           setTexte((t) => [...t, evt.data.delta]);
         } else if (evt.event === "proposition") {
           setProps((p) => [...p, evt.data]);
@@ -414,6 +437,11 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             sessionId,
             evt.data.session ?? sessionEdit ?? sessionId,
             moteurSession ?? moteurEdit ?? "Roch",
+          );
+          useDiscussions.getState().ajouterMessage(
+            sessionId,
+            "assistant",
+            resume.trim() || "Propositions générées.",
           );
         }
       }
@@ -450,6 +478,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   ) {
     setTacheActive(true);
     setBusy(true);
+    let resume = "";
     try {
       for await (const evt of flux) {
         setTachesOpenCode((taches) =>
@@ -468,6 +497,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             evt.data.moteur,
           );
         } else if (evt.event === "texte") {
+          resume += evt.data.delta;
           setTexte((t) => [...t, evt.data.delta]);
         } else if (evt.event === "erreur") {
           setErreur({
@@ -484,6 +514,11 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             sessionId,
             evt.data.session ?? sessionId,
             moteurSession ?? moteurEdit ?? "Roch",
+          );
+          useDiscussions.getState().ajouterMessage(
+            sessionId,
+            "assistant",
+            resume.trim() || "Tâche terminée.",
           );
         }
       }
@@ -505,34 +540,42 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   // outils et écrire directement plusieurs fichiers dans le dossier courant.
   async function envoyerAutonome() {
     const consigne = message;
-    if (!consigne.trim() || busy || !projet) return;
-    const historique = useDiscussions.getState();
-    const sessionId = activeEditId ?? historique.nouvelle("edit");
-    repriseTacheRef.current = `${projet}:${sessionId}`;
-    historique.ajouterMessage(sessionId, "user", consigne);
-    setBusy(true);
-    setTacheActive(true);
-    setTexte([]);
-    const executionId = "opencode-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
-    tacheCouranteRef.current = executionId;
-    setTachesOpenCode((taches) => [...taches, { id: executionId, consigne, events: [] }]);
-    setResultats([]);
-    setProps([]);
-    setErreur(null);
-    empreintesTacheRef.current = {};
-    abortRef.current?.abort();
-    const controller = new AbortController();
-    abortRef.current = controller;
-    setMessage("");
-    await consommerFluxTache(
-      executionId,
-      sessionId,
-      tacheAgent(projet, consigne, {
-        session: sessionId,
-        signal: controller.signal,
-      }),
-      controller,
-    );
+    if (!consigne.trim() || busy || !projet || lancementAutonomeRef.current) return;
+    // Le verrou synchrone ferme la petite fenêtre avant le rerender de `busy`.
+    // Deux clics/Entrées rapides ne doivent pas créer deux sessions distinctes.
+    lancementAutonomeRef.current = true;
+    try {
+      const historique = useDiscussions.getState();
+      const sessionId = activeEditId ?? historique.nouvelle("edit");
+      tacheSessionRef.current = sessionId;
+      repriseTacheRef.current = `${projet}:${sessionId}`;
+      historique.ajouterMessage(sessionId, "user", consigne);
+      setBusy(true);
+      setTacheActive(true);
+      setTexte([]);
+      const executionId = "opencode-" + Date.now() + "-" + Math.random().toString(36).slice(2, 8);
+      tacheCouranteRef.current = executionId;
+      setTachesOpenCode([{ id: executionId, consigne, events: [] }]);
+      setResultats([]);
+      setProps([]);
+      setErreur(null);
+      empreintesTacheRef.current = {};
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+      setMessage("");
+      await consommerFluxTache(
+        executionId,
+        sessionId,
+        tacheAgent(projet, consigne, {
+          session: sessionId,
+          signal: controller.signal,
+        }),
+        controller,
+      );
+    } finally {
+      lancementAutonomeRef.current = false;
+    }
   }
 
   function basculer(fichier: string, idHunk: number) {
@@ -694,6 +737,14 @@ export function ChatPanel({ projet }: ChatPanelProps) {
               : "L'agent propose des modifications de fichiers ci-dessous — valide bloc par bloc puis applique."}
           </div>
         )}
+        {!enChat && messagesEditVisibles.map((message, index) => (
+          <BulleChat
+            key={`edit-history-${index}`}
+            message={message}
+            dernier={false}
+            busy={false}
+          />
+        ))}
         {!enChat && executionEdit === "apercu" &&
           texte.map((t, i) => (
             <div key={i} className="chat-texte">{t}</div>

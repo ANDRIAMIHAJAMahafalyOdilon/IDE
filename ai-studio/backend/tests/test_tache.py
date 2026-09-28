@@ -351,10 +351,11 @@ def test_tache_sans_processus_demarre_la_cli_et_non_le_serveur():
     Cette vérification protège contre le double `if processus is None` qui
     rendait auparavant tout le code CLI inatteignable.
     """
-    appels = {}
+    appels = {"nombre": 0}
     ancien = at._demarrer
 
     def demarrer(binaire, racine, message, sid):
+        appels["nombre"] += 1
         appels.update(binaire=binaire, racine=racine, message=message, sid=sid)
         return FauxProcessus([
             _evt("text", sid="sess-cli", part={"id": "p", "type": "text", "text": "OK"}),
@@ -376,6 +377,7 @@ def test_tache_sans_processus_demarre_la_cli_et_non_le_serveur():
         at._demarrer = ancien
 
     assert appels["binaire"] == "opencode.exe"
+    assert appels["nombre"] == 1
     assert appels["message"] == "teste la CLI"
     assert [nom for nom, _ in evts] == ["debut", "texte", "fin"]
 
