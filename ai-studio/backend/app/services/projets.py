@@ -13,9 +13,11 @@ import hashlib
 import io
 import os
 import shutil
+import stat
 import tarfile
 import tempfile
 import zipfile
+from collections.abc import Iterator
 from pathlib import Path
 
 from ..config import PROJETS_DIR
@@ -80,12 +82,32 @@ def _est_binaire(chemin: Path) -> bool:
     return b"\x00" in tete
 
 
+def _fichiers_lisibles(racine: Path, flt) -> Iterator[tuple[str, Path]]:
+    """Itère (chemin relatif, Path) des fichiers réguliers non filtrés.
+
+    Ignore silencieusement toute entrée inaccessible. Un projet ouvert en mode
+    direct peut pointer n'importe où sur le disque : sockets Docker (WinError
+    1920), tubes, permissions refusées, fichier supprimé pendant le parcours.
+    Une seule entrée aberrante ne doit jamais invalider le parcours complet.
+    """
+    try:
+        iterateur = racine.rglob("*")
+        for p in iterateur:
+            try:
+                if not p.is_file():
+                    continue
+                rel = p.relative_to(racine).as_posix()
+                if flt.ignore(rel):
+                    continue
+            except OSError:
+                continue
+            yield rel, p
+    except OSError:
+        return
+
+
 def compter_fichiers(racine: Path) -> int:
-    flt = filtres_pour(racine)
-    return sum(
-        1 for p in racine.rglob("*")
-        if p.is_file() and not flt.ignore(p.relative_to(racine).as_posix())
-    )
+    return sum(1 for _ in _fichiers_lisibles(racine, filtres_pour(racine)))
 
 
 def lister_projets() -> list[dict]:
@@ -205,12 +227,17 @@ def exporter_archive(nom: str) -> tuple[Path, str]:
     dossier = _slug(nom)
     with zipfile.ZipFile(chemin, "w", zipfile.ZIP_DEFLATED) as z:
         for src in racine.rglob("*"):
-            if src.is_dir():
+            # Mêmes exclusions que l'arborescence : un socket, un tube ou un
+            # fichier devenu inaccessible ferait échouer tout l'export.
+            try:
+                if src.is_dir() or not src.is_file():
+                    continue
+                rel = src.relative_to(racine)
+                if any(part in IGNORE_DOSSIERS for part in rel.parts):
+                    continue
+                z.write(src, Path(dossier) / rel)
+            except OSError:
                 continue
-            rel = src.relative_to(racine)
-            if any(part in IGNORE_DOSSIERS for part in rel.parts):
-                continue
-            z.write(src, Path(dossier) / rel)
     return chemin, f"{dossier}.zip"
 
 
@@ -227,18 +254,37 @@ def _noeuds(racine: Path, dossier: Path, flt) -> list[dict]:
 
     Applique les filtres (dossiers lourds + .gitignore) AVANT toute descente
     récursive : un dossier ignoré est sauté sans être listé ni parcouru.
+
+    Une entrée illisible est IGNORÉE, jamais fatale. Un projet ouvert en mode
+    direct peut être n'importe quel dossier du disque : sockets Docker
+    (`.sock`, WinError 1920 sous Windows), tubes, liens cassés, fichiers
+    supprimés entre le listage et le `stat`, dossiers sans permission. Faire
+    échouer toute l'arborescence pour une entrée aberrante rendrait
+    l'éditeur inutilisable sur un dossier de travail réaliste.
     """
     entrees = []
-    for p in sorted(dossier.iterdir()):
-        rel = p.relative_to(racine).as_posix()
-        if flt.ignore(rel, est_dossier=p.is_dir()):
+    try:
+        fils = sorted(dossier.iterdir())
+    except OSError:
+        return entrees
+    for p in fils:
+        try:
+            rel = p.relative_to(racine).as_posix()
+            est_dossier = p.is_dir()
+            if flt.ignore(rel, est_dossier=est_dossier):
+                continue
+            if est_dossier:
+                entrees.append({"nom": p.name, "chemin": rel, "type": "dossier",
+                                "enfants": _noeuds(racine, p, flt)})
+            else:
+                infos = p.stat()
+                # Socket, tube, périphérique : rien à afficher ni à ouvrir.
+                if not stat.S_ISREG(infos.st_mode):
+                    continue
+                entrees.append({"nom": p.name, "chemin": rel, "type": "fichier",
+                                "taille": infos.st_size})
+        except OSError:
             continue
-        if p.is_dir():
-            entrees.append({"nom": p.name, "chemin": rel, "type": "dossier",
-                            "enfants": _noeuds(racine, p, flt)})
-        else:
-            entrees.append({"nom": p.name, "chemin": rel, "type": "fichier",
-                            "taille": p.stat().st_size})
     return sorted(entrees, key=lambda e: (e["type"] != "dossier", e["nom"].lower()))
 
 
@@ -295,14 +341,19 @@ def rechercher(nom: str, q: str) -> dict:
     resultats: list[dict] = []
     total_corr = 0
     for p in racine.rglob("*"):
-        if p.is_dir():
+        try:
+            if p.is_dir():
+                continue
+            rel = p.relative_to(racine).as_posix() if p.is_file() else p.name
+            if not p.is_file() or flt.ignore(rel):
+                continue
+            if _est_binaire(p) or p.stat().st_size > TAILLE_MAX_FICHIER:
+                continue
+            lignes = workspace.lire_fichier(p).splitlines()
+        except OSError:
             continue
-        rel = p.relative_to(racine).as_posix() if p.is_file() else p.name
-        if not p.is_file() or flt.ignore(rel):
+        except UnicodeDecodeError:
             continue
-        if _est_binaire(p) or p.stat().st_size > TAILLE_MAX_FICHIER:
-            continue
-        lignes = workspace.lire_fichier(p).splitlines()
         correspondances = []
         for i, ligne in enumerate(lignes):
             if motif in ligne.lower():
@@ -337,8 +388,13 @@ def etat_fichiers(nom: str, chemins: list[str] | None = None) -> dict:
             continue
         if rel == ".":
             for p in racine.rglob("*"):
-                if p.is_file() and not flt.ignore(p.relative_to(racine).as_posix()):
-                    etats[p.relative_to(racine).as_posix()] = _sha_file(p)
+                # Endpoint de polling de l'agent : une entrée illisible ne doit
+                # pas interrompre le relevé des autres fichiers.
+                try:
+                    if p.is_file() and not flt.ignore(p.relative_to(racine).as_posix()):
+                        etats[p.relative_to(racine).as_posix()] = _sha_file(p)
+                except OSError:
+                    continue
             continue
         try:
             chemin = chemin_securise(racine, rel)
@@ -441,15 +497,9 @@ def apercu_dossier_local(texte: str) -> dict:
     Lève ValueError si le chemin est refusé par la validation.
     """
     chemin, nom = registre.valider_chemin_local(texte)
-    flt = filtres_pour(chemin)
     exemples: list[str] = []
     total = 0
-    for p in chemin.rglob("*"):
-        if not p.is_file():
-            continue
-        rel = p.relative_to(chemin).as_posix()
-        if flt.ignore(rel):
-            continue
+    for rel, _ in _fichiers_lisibles(chemin, filtres_pour(chemin)):
         total += 1
         if len(exemples) < MAX_EXEMPLES_APERCU:
             exemples.append(rel)
@@ -469,10 +519,6 @@ def ouvrir_dossier_local(texte: str) -> dict:
     fichiers est mémorisé au registre (rafraîchit le listing sans re-scanner).
     """
     racine, _ = registre.valider_chemin_local(texte)
-    flt = filtres_pour(racine)
-    nb = sum(
-        1 for p in racine.rglob("*")
-        if p.is_file() and not flt.ignore(p.relative_to(racine).as_posix())
-    )
+    nb = sum(1 for _ in _fichiers_lisibles(racine, filtres_pour(racine)))
     entree = registre.ajouter_dossier_direct(str(racine), nb_fichiers=nb)
     return {**entree, "origine": "dossier", "nb_fichiers": nb}

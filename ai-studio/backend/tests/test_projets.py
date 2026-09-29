@@ -256,6 +256,57 @@ def test_etat_ignore_les_chemins_hors_projet():
         }
 
 
+class _PathInaccessible(pathlib.Path):
+    """`Path` dont `stat()` échoue sur un nom donné, comme un socket Docker.
+
+    Reproduit le WinError 1920 réellement observé sous Windows sans
+    monkeypatch global : `rglob` conserve le type de la racine, donc les
+    enfants lèvent aussi.
+    """
+
+    CIBLE = "mysql.sock"
+
+    def stat(self, *args, **kwargs):
+        if self.name == self.CIBLE:
+            raise OSError(1920, "Le système ne peut pas accéder au fichier")
+        return super().stat(*args, **kwargs)
+
+
+def test_arborescence_ignore_les_entrees_inaccessibles():
+    """Une entrée illisible ne doit pas casser le parcours du projet.
+
+    Ouvrir un dossier en mode direct peut viser n'importe quel dossier de
+    travail. `p.stat()` non protégé sur un socket Docker faisait répondre 500
+    à TOUTE l'arborescence, donc l'éditeur devenait inutilisable.
+
+    Limite du test : la sous-classe ne couvre que l'appel `Path.stat()`, celui
+    de `projets._noeuds` — la ligne exacte du traceback. `Path.is_file()`
+    passe par `os.stat` et n'est pas simulé ici.
+    """
+    racine = _PathInaccessible(tempfile.mkdtemp())
+    (racine / "src").mkdir()
+    (racine / "src" / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (racine / "lisible.txt").write_text("ok\n", encoding="utf-8")
+    (racine / "db-data").mkdir()
+    (racine / "db-data" / "mysql.sock").write_bytes(b"")
+
+    flt = ps.filtres_pour(racine)
+    arbre = ps._noeuds(racine, racine, flt)
+    noms = sorted(e["nom"] for e in arbre)
+
+    assert noms == ["db-data", "lisible.txt", "src"], noms
+
+    # Le socket est illisible : le dossier est listé mais vide, pas fatal.
+    db_data = next(e for e in arbre if e["nom"] == "db-data")
+    assert db_data["enfants"] == [], db_data
+
+    # Les fichiers lisibles sont bien remontés, taille comprise. La taille est
+    # relue sur disque : `write_text` traduit `\n` en `\r\n` sous Windows.
+    src = next(e for e in arbre if e["nom"] == "src")
+    assert src["enfants"][0]["chemin"] == "src/main.py"
+    assert src["enfants"][0]["taille"] == (racine / "src" / "main.py").stat().st_size
+
+
 def _tout_executer():
     tests = sorted(
         (nom, obj) for nom, obj in globals().items()
