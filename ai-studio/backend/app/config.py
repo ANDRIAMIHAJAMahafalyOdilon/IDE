@@ -19,7 +19,16 @@ load_dotenv(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / "backend" / ".env", override=False)
 
 # Dossier qui contient les projets importés (arborescences téléchargées / créées).
-DATA_DIR = PROJECT_ROOT / "data"
+# Surchargeable (DATA_DIR) pour pointer vers un disque persistant ou un dossier
+# éphémère d'un déploiement cloud ; tous les chemins de données en découlent.
+DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
+
+# Build du frontend Vite. En développement il n'existe pas (Vite sert la SPA sur
+# 5173 et proxifie /api) ; en production le backend sert directement dist/,
+# ce qui évite un second domaine et tout config CORS.
+FRONTEND_DIST = Path(
+    os.getenv("FRONTEND_DIST", str(PROJECT_ROOT / "frontend" / "dist"))
+)
 PROJETS_DIR = Path(os.getenv("PROJETS_DIR", str(DATA_DIR / "projets")))
 # Mémoire durable des fils Chat/Edit. Elle ne dépend plus de la durée de vie
 # du processus backend (redémarrage du serveur ou rechargement en développement).

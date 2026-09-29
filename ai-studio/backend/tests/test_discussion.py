@@ -78,12 +78,19 @@ def _restaure(sauv):
     moteurs.gemini_flux, moteurs.groq_flux = sauv
 
 
+def _reponse(prompt):
+    """Joue `stream_reponse` et renvoie (moteurs annoncés, deltas émis)."""
+    evenements = list(agent_discussion.stream_reponse(prompt))
+    return (
+        [c for g, c in evenements if g == "moteur"],
+        [c for g, c in evenements if g == "delta"],
+    )
+
+
 def test_gemini_prioritaire_et_agregation():
     sauv = _patch(lambda c: iter(["Bon", "jour"]), lambda c: iter(["jamais"]))
     try:
-        moteur, flux = agent_discussion.demarrer_reponse("prompt")
-        assert moteur == "gemini"
-        assert "".join(flux) == "Bonjour"
+        assert _reponse("prompt") == (["gemini"], ["Bon", "jour"])
     finally:
         _restaure(sauv)
 
@@ -95,9 +102,8 @@ def test_bascule_groq_si_gemini_echoue_avant_token():
 
     sauv = _patch(casse, lambda c: iter(["secours"]))
     try:
-        moteur, flux = agent_discussion.demarrer_reponse("prompt")
-        assert moteur == "groq"
-        assert "".join(flux) == "secours"
+        # Aucun delta n'ayant été émis, il n'y a rien à effacer : pas de reprise.
+        assert _reponse("prompt") == (["groq"], ["secours"])
     finally:
         _restaure(sauv)
 
@@ -105,9 +111,7 @@ def test_bascule_groq_si_gemini_echoue_avant_token():
 def test_flux_vide_passe_au_moteur_suivant():
     sauv = _patch(lambda c: iter([]), lambda c: iter(["ok"]))
     try:
-        moteur, flux = agent_discussion.demarrer_reponse("prompt")
-        assert moteur == "groq"
-        assert "".join(flux) == "ok"
+        assert _reponse("prompt") == (["groq"], ["ok"])
     finally:
         _restaure(sauv)
 
@@ -122,7 +126,7 @@ def test_tous_echecs_leve_moteur_indisponible():
     sauv = _patch(casse("auth"), casse("timeout"))
     try:
         try:
-            agent_discussion.demarrer_reponse("prompt")
+            list(agent_discussion.stream_reponse("prompt"))
         except ErreurMoteur as exc:
             assert exc.code == "moteur_indisponible"
             assert "auth" in exc.message and "timeout" in exc.message
@@ -132,23 +136,115 @@ def test_tous_echecs_leve_moteur_indisponible():
         _restaure(sauv)
 
 
-def test_erreur_en_cours_de_flux_propage():
+def test_coupure_en_cours_de_flux_bascule_sans_coupure():
+    """Exigence : aucune coupure visible pendant la discussion.
+
+    Gemini s'interrompt APRÈS avoir envoyé des tokens. Le service doit
+    basculer sur Groq, signaler `reprise` (le client efface alors le partiel)
+    et diffuser une réponse complète — pas laisser une phrase coupée."""
     def mi_flux(c):
-        yield "début"
+        yield "début de réponse"
+        yield "qui s'inter"
         raise ErreurMoteur("timeout", "gemini : délai dépassé.")
 
-    sauv = _patch(mi_flux, lambda c: iter(["jamais"]))
+    sauv = _patch(mi_flux, lambda c: iter(["réponse", "complète"]))
     try:
-        moteur, flux = agent_discussion.demarrer_reponse("prompt")
-        assert moteur == "gemini"
+        evenements = list(agent_discussion.stream_reponse("prompt"))
+    finally:
+        _restaure(sauv)
+
+    genres = [e[0] for e in evenements]
+    assert genres == ["moteur", "delta", "delta", "reprise", "delta", "delta"]
+    assert evenements[0] == ("moteur", "gemini")
+    reprise = evenements[3]
+    assert reprise[0] == "reprise"
+    assert reprise[1][0] == "groq"
+    assert "délai dépassé" in reprise[1][1]
+    deltas = [c for g, c in evenements if g == "delta"]
+    assert deltas == ["début de réponse", "qui s'inter", "réponse", "complète"]
+    # Le client reçoit bien la fin du texte : aucun delta vide marquant l'arrêt.
+    assert deltas[-1] == "complète"
+
+
+def test_plus_de_reprise_emise_quand_le_secours_echoue():
+    """Groq tombe aussi : plus rien à basculer, on remonte l'échec — et on ne
+    signale PAS une seconde reprise (le client n'aurait rien à effacer)."""
+    def coupe(c):
+        yield "a"
+        raise ErreurMoteur("quota", "gemini : quota.")
+        yield  # pragma: no cover
+
+    def coupe_aussi(c):
+        yield "b"
+        raise ErreurMoteur("timeout", "groq : délai.")
+        yield  # pragma: no cover
+
+    sauv = _patch(coupe, coupe_aussi)
+    try:
         try:
-            "".join(flux)
+            list(agent_discussion.stream_reponse("prompt"))
         except ErreurMoteur as exc:
-            assert exc.code == "timeout"
-            return
+            genres = []
+            assert exc.code == "moteur_indisponible"
+            assert "quota" in exc.message and "timeout" in exc.message
+            return genres
         raise AssertionError("ErreurMoteur attendue")
     finally:
         _restaure(sauv)
+
+
+def test_bascule_en_chaine_puis_echec_final():
+    """Gemini stream puis coupe, Groq stream puis coupe : une SEULE reprise,
+    puis l'échec remonte une fois le texte réellement reçu."""
+    def coupe(nom, texte):
+        def _f(c):
+            yield texte
+            raise ErreurMoteur("timeout", f"{nom} : délai.")
+            yield  # pragma: no cover
+        return _f
+
+    sauv = _patch(coupe("gemini", "partiel"), coupe("groq", "secours"))
+    genres: list[str] = []
+    try:
+        try:
+            for e in agent_discussion.stream_reponse("prompt"):
+                genres.append(e[0])
+        except ErreurMoteur as exc:
+            assert exc.code == "moteur_indisponible"
+            assert "gemini" in exc.message and "groq" in exc.message
+        else:
+            raise AssertionError("ErreurMoteur attendue en fin de chaîne")
+    finally:
+        _restaure(sauv)
+    # Un seul `reprise` : le client n'a rien à effacer une seconde fois.
+    assert genres == ["moteur", "delta", "reprise", "delta"], genres
+
+
+def test_moteur_vide_puis_secours_coupe_sans_reprise():
+    """Gemini ne renvoie rien : aucun delta n'ayant été affiché, le passage à
+    Groq ne demande AUCUNE reprise (le client n'a rien à effacer)."""
+    def vide(c):
+        return iter([])
+        yield  # pragma: no cover
+
+    def coupe(c):
+        yield "secours partiel"
+        raise ErreurMoteur("quota", "groq : quota.")
+        yield  # pragma: no cover
+
+    sauv = _patch(vide, coupe)
+    genres: list[str] = []
+    try:
+        try:
+            for e in agent_discussion.stream_reponse("prompt"):
+                genres.append(e[0])
+        except ErreurMoteur as exc:
+            assert exc.code == "moteur_indisponible"
+        else:
+            raise AssertionError("ErreurMoteur attendue en fin de chaîne")
+    finally:
+        _restaure(sauv)
+    assert genres == ["moteur", "delta"], genres
 
 
 # ───────────────────── Événementiel /chat (mode chat) ────────────────────────
@@ -162,8 +258,10 @@ def _evenements(events):
 
 
 def test_generer_discussion_debut_texte_fin_sans_proposition():
-    sauv = agent_discussion.demarrer_reponse
-    agent_discussion.demarrer_reponse = lambda p: ("gemini", iter(["Bon", "jour"]))
+    sauv = agent_discussion.stream_reponse
+    agent_discussion.stream_reponse = lambda p: iter(
+        [("moteur", "gemini"), ("delta", "Bon"), ("delta", "jour")]
+    )
     agent._MEMOIRE.pop(("chat", "sess-chat-test"), None)
     try:
         req = RequeteChat(mode="chat", message="salut", session="sess-chat-test")
@@ -178,18 +276,52 @@ def test_generer_discussion_debut_texte_fin_sans_proposition():
         assert memoire[-1]["question"] == "salut"
         assert memoire[-1]["reponse"] == "Bonjour"
     finally:
-        agent_discussion.demarrer_reponse = sauv
+        agent_discussion.stream_reponse = sauv
         agent._MEMOIRE.pop(("chat", "sess-chat-test"), None)
         nom = hashlib.sha256(b"chat:sess-chat-test").hexdigest() + ".json"
+        (agent.MEMOIRE_DIR / nom).unlink(missing_ok=True)
+
+
+def test_generer_discussion_reprise_efface_le_partiel():
+    """Bout-en-bout : une coupure en cours de route produit `reprise`, et la
+    mémoire du fil ne conserve QUE la réponse du moteur de secours — pas le
+    texte tronqué du moteur mort."""
+    def flux(p):
+        yield ("moteur", "gemini")
+        yield ("delta", "texte tron")
+        yield ("reprise", ("groq", "gemini : délai dépassé."))
+        yield ("delta", "réponse")
+        yield ("delta", "complète")
+
+    sauv = agent_discussion.stream_reponse
+    agent_discussion.stream_reponse = flux
+    agent._MEMOIRE.pop(("chat", "sess-reprise"), None)
+    try:
+        req = RequeteChat(mode="chat", message="salut", session="sess-reprise")
+        noms, datas = _evenements(
+            asyncio.run(_collecte(agent.generer_discussion(req)))
+        )
+        assert noms == ["debut", "texte", "reprise", "texte", "texte", "fin"]
+        reprise = datas[noms.index("reprise")]
+        assert reprise["moteur"] == "groq"
+        assert "délai dépassé" in reprise["raison"]
+        memoire = agent._memoire("chat", "sess-reprise")
+        assert memoire[-1]["reponse"] == "réponsecomplète"
+        assert "tron" not in memoire[-1]["reponse"]
+    finally:
+        agent_discussion.stream_reponse = sauv
+        agent._MEMOIRE.pop(("chat", "sess-reprise"), None)
+        nom = hashlib.sha256(b"chat:sess-reprise").hexdigest() + ".json"
         (agent.MEMOIRE_DIR / nom).unlink(missing_ok=True)
 
 
 def test_generer_discussion_erreur_moteur():
     def casse(p):
         raise ErreurMoteur("quota", "gemini : quota dépassé.")
+        yield  # pragma: no cover
 
-    sauv = agent_discussion.demarrer_reponse
-    agent_discussion.demarrer_reponse = casse
+    sauv = agent_discussion.stream_reponse
+    agent_discussion.stream_reponse = casse
     agent._MEMOIRE.pop(("chat", "sess-err"), None)
     try:
         req = RequeteChat(mode="chat", message="salut", session="sess-err")
@@ -197,7 +329,7 @@ def test_generer_discussion_erreur_moteur():
         assert noms == ["erreur"]
         assert datas[0]["code"] == "quota"
     finally:
-        agent_discussion.demarrer_reponse = sauv
+        agent_discussion.stream_reponse = sauv
         agent._MEMOIRE.pop(("chat", "sess-err"), None)
 
 
@@ -240,6 +372,132 @@ def test_memoire_rechargee_apres_redemarrage_backend():
         (agent.MEMOIRE_DIR / nom).unlink(missing_ok=True)
         if ancienne is not None:
             agent._MEMOIRE[("chat", sid)] = ancienne
+
+
+# ─────────────────────── Purge des dictionnaires globaux ─────────────────────
+
+def test_purge_par_ttl_retire_les_entrees_perimees():
+    agent._MEMOIRE.clear()
+    agent._MEMOIRE_TS.clear()
+    agent._memoire("chat", "vieux")
+    agent._memoire("chat", "recent")
+    # On vieillit « vieux » de plus que le TTL : la purge doit l'éliminer.
+    agent._MEMOIRE_TS[("chat", "vieux")] -= agent.TTL_MEMOIRE_SECONDES + 1
+    try:
+        agent._purger()
+        assert ("chat", "vieux") not in agent._MEMOIRE
+        assert ("chat", "vieux") not in agent._MEMOIRE_TS
+        assert ("chat", "recent") in agent._MEMOIRE
+    finally:
+        agent._MEMOIRE.clear()
+        agent._MEMOIRE_TS.clear()
+
+
+def test_purge_par_taille_supprime_les_plus_anciennes():
+    agent._MEMOIRE.clear()
+    agent._MEMOIRE_TS.clear()
+    for i in range(5):
+        agent._memoire("chat", f"s{i}")
+    maximum = agent.MAX_ENTREES_MEMOIRE
+    agent.MAX_ENTREES_MEMOIRE = 2
+    try:
+        agent._purger()
+        # Les trois plus anciennes partent, les deux plus récentes restent.
+        assert sorted(k[1] for k in agent._MEMOIRE) == ["s3", "s4"]
+    finally:
+        agent.MAX_ENTREES_MEMOIRE = maximum
+        agent._MEMOIRE.clear()
+        agent._MEMOIRE_TS.clear()
+
+
+def test_purge_taches_preserve_les_taches_en_cours():
+    agent._TACHES.clear()
+    maximum = agent.MAX_ENTREES_MEMOIRE
+    agent.MAX_ENTREES_MEMOIRE = 1
+    try:
+        active = agent.EtatTache("projet", "s1", "en cours")
+        terminee = agent.EtatTache("projet", "s2", "finie")
+        terminee.terminee = True
+        terminee.creee -= 10_000  # ancienne ET terminée
+        agent._TACHES[("projet", "s1")] = active
+        agent._TACHES[("projet", "s2")] = terminee
+        agent._purger()
+        assert ("projet", "s1") in agent._TACHES  # jamais purgée en cours
+        assert ("projet", "s2") not in agent._TACHES
+    finally:
+        agent.MAX_ENTREES_MEMOIRE = maximum
+        agent._TACHES.clear()
+
+
+def test_purge_taches_ne_purge_jamais_une_tache_active():
+    """Régression : le tri par excédent de taille ne filtrait que
+    « pas déjà périmé », sans exiger `terminee`. Avec plus de tâches actives que
+    le plafond et aucune tâche terminée, la purge en retirait quand même, et
+    le client ne pouvait plus se rattacher à une tâche EN COURS (`GET
+    /agent/tache/{id}` -> 404) alors que le contrat l'interdit."""
+    agent._TACHES.clear()
+    maximum = agent.MAX_ENTREES_MEMOIRE
+    agent.MAX_ENTREES_MEMOIRE = 2
+    try:
+        actives = []
+        for i in range(5):
+            etat = agent.EtatTache("projet", f"s{i}", "en cours")
+            etat.creee -= 10_000  # anciennes, mais toujours en cours
+            actives.append(("projet", f"s{i}"))
+            agent._TACHES[("projet", f"s{i}")] = etat
+        agent._purger()
+        assert len(agent._TACHES) == 5, "aucune tâche active ne doit être purgée"
+        assert all(cle in agent._TACHES for cle in actives)
+    finally:
+        agent.MAX_ENTREES_MEMOIRE = maximum
+        agent._TACHES.clear()
+
+
+def test_purge_taches_priorise_les_terminees_par_ordre_chronologique():
+    agent._TACHES.clear()
+    maximum = agent.MAX_ENTREES_MEMOIRE
+    agent.MAX_ENTREES_MEMOIRE = 3
+    try:
+        for i in range(4):
+            etat = agent.EtatTache("projet", f"s{i}", "finie")
+            etat.terminee = True
+            etat.creee = float(i)  # s0 la plus ancienne
+            agent._TACHES[("projet", f"s{i}")] = etat
+        agent._purger()
+        # Une seule place à libérer : la plus ancienne part, les 3 autres restent.
+        restants = sorted(k[1] for k in agent._TACHES)
+        assert restants == ["s1", "s2", "s3"], restants
+    finally:
+        agent.MAX_ENTREES_MEMOIRE = maximum
+        agent._TACHES.clear()
+
+
+def test_purge_taches_ne_supprime_rien_si_sous_le_seuil():
+    agent._TACHES.clear()
+    try:
+        etat = agent.EtatTache("projet", "s1", "finie")
+        etat.terminee = True
+        agent._TACHES[("projet", "s1")] = etat
+        agent._purger()
+        # Une tâche terminée reste rejouable tant que le TTL n'est pas atteint.
+        assert ("projet", "s1") in agent._TACHES
+    finally:
+        agent._TACHES.clear()
+
+
+def test_sessions_opencode_sont_purgees():
+    agent._SESSIONS_OPENCODE.clear()
+    agent._SESSIONS_OPENCODE_TS.clear()
+    cle = ("projet", "sess")
+    agent._SESSIONS_OPENCODE[cle] = "ses_1"
+    agent._SESSIONS_OPENCODE_TS[cle] = agent._time.monotonic() - agent.TTL_MEMOIRE_SECONDES - 1
+    try:
+        agent._purger()
+        assert cle not in agent._SESSIONS_OPENCODE
+        assert cle not in agent._SESSIONS_OPENCODE_TS
+    finally:
+        agent._SESSIONS_OPENCODE.clear()
+        agent._SESSIONS_OPENCODE_TS.clear()
 
 
 # ────────────────────────────────────────────────────────────────────────────

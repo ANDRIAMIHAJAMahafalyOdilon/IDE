@@ -135,15 +135,21 @@ export const useStudio = create<EtatStudio>()(
         })),
 
       sauverFichier: async (chemin) => {
-        const { projet, contenus } = get();
+        const { projet } = get();
         if (!projet) return;
+        // On fige le texte ENVOYÉ : c'est lui qui devient la projection.
+        // Relire `get().contenus` APRÈS le await prendrait en compte des
+        // frappes survenues pendant l'écriture et marquerait l'onglet propre
+        // alors qu'il contient du texte non sauvegardé — le poll de l'agent
+        // (`rechargerFichiers`) écraserait alors ces frappes.
+        const envoye = get().contenus[chemin] ?? "";
         try {
-          const ecrit = await ecrireFichier(projet, chemin, contenus[chemin] ?? "");
+          await ecrireFichier(projet, chemin, envoye);
           set((s) => ({
-            projection: { ...s.projection, [chemin]: contenus[chemin] ?? "" },
-            dirty: { ...s.dirty, [chemin]: false },
+            projection: { ...s.projection, [chemin]: envoye },
+            // Sale seulement si l'utilisateur a continué à taper entre-temps.
+            dirty: { ...s.dirty, [chemin]: (s.contenus[chemin] ?? "") !== envoye },
           }));
-          void ecrit; // nouveau_sha utile plus tard (rafraîchir les propositions)
         } catch (e) {
           set({ erreur: e instanceof Error ? e.message : String(e) });
         }

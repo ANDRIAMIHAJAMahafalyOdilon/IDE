@@ -7,6 +7,7 @@ Exécutables sans réseau ni serveur (uniquement le disco/archive) :
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import pathlib
 import sys
@@ -35,6 +36,10 @@ def _projets_isoles():
             yield racine
         finally:
             _reg._FICHIER = ancien_registre
+
+
+def _sha(contenu: str) -> str:
+    return hashlib.sha1(contenu.encode("utf-8")).hexdigest()
 
 
 def _zip(mini: dict[str, str]) -> bytes:
@@ -212,6 +217,43 @@ def test_etat_fichiers_tout_le_projet():
         _importer({"a.txt": "1", "b.txt": "2"}, "p")
         ensemble = ps.etat_fichiers("p")
         assert set(ensemble["fichiers"]) == {"a.txt", "b.txt"}
+
+
+def test_etat_projet_inconnu_renvoie_404_pas_500():
+    """Régression : `GET /{projet}/etat` laissait remonter FileNotFoundError,
+    que FastAPI rendait en 500 « Internal Server Error ». Le frontend polling
+    ce endpoint sur un projet supprimé entre-temps interpretait ce 500 comme
+    une panne du serveur au lieu d'un projet absent."""
+    from fastapi import FastAPI
+    from fastapi.testclient import TestClient
+
+    from app.api.projets import router
+
+    app = FastAPI()
+    app.include_router(router)
+    client = TestClient(app, raise_server_exceptions=False)
+
+    with _projets_isoles():
+        _importer({"a.txt": "hello"}, "p")
+        r = client.get("/api/projects/p/etat")
+        assert r.status_code == 200, r.text
+        assert r.json()["fichiers"]["a.txt"] == _sha("hello")
+
+        # Projet absent (supprimé entre deux polls) : 404 attendu, jamais 500.
+        r = client.get("/api/projects/inexistant/etat")
+        assert r.status_code == 404, r.text
+        assert r.status_code != 500
+
+
+def test_etat_ignore_les_chemins_hors_projet():
+    """Choix de conception du service : un chemin hors projet est ignoré, pas
+    une erreur (le poll reste tolérant). Rien n'est lu hors du projet."""
+    with _projets_isoles():
+        _importer({"a.txt": "hello"}, "p")
+        assert ps.etat_fichiers("p", ["../../evasion.txt"]) == {"projet": "p", "fichiers": {}}
+        assert ps.etat_fichiers("p", ["a.txt"]) == {
+            "projet": "p", "fichiers": {"a.txt": _sha("hello")}
+        }
 
 
 def _tout_executer():

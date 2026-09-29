@@ -107,6 +107,61 @@ def test_action_suppression():
         assert not (racine / "a.txt").exists()
 
 
+def test_suppression_respecte_le_source_hash():
+    """Une suppression EST une écriture : elle ne doit pas être plus laxiste
+    que l'écriture sur la péremption. Avant, valider une proposition ancienne
+    effaçait un fichier modifié depuis (perte de données silencieuse)."""
+    with tempfile.TemporaryDirectory() as tmp:
+        racine = pathlib.Path(tmp)
+        _ecrire(tmp, "vital.txt", "version proposee\n")
+        diff = build_diff("version proposee\n", "")
+        # Le fichier change entre la proposition et la validation.
+        _ecrire(tmp, "vital.txt", "modifie par ailleurs\n")
+
+        resultats = application.appliquer_changements(racine, [
+            {"fichier": "vital.txt", "action": "delete",
+             "source_hash": diff["source_hash"], "acceptes": []}
+        ])
+        assert resultats[0].statut == "erreur"
+        assert "périmé" in (resultats[0].message or "")
+        assert (racine / "vital.txt").exists()
+        assert workspace.lire_fichier_ou(racine / "vital.txt") == "modifie par ailleurs\n"
+
+
+def test_suppression_acceptee_si_fichier_inchange():
+    with tempfile.TemporaryDirectory() as tmp:
+        racine = pathlib.Path(tmp)
+        _ecrire(tmp, "obsolete.txt", "l identique\n")
+        diff = build_diff("l identique\n", "")
+        resultats = application.appliquer_changements(racine, [
+            {"fichier": "obsolete.txt", "action": "delete",
+             "source_hash": diff["source_hash"], "acceptes": []}
+        ])
+        assert resultats[0].statut == "ok"
+        assert not (racine / "obsolete.txt").exists()
+
+
+def test_suppression_fichier_deja_absent():
+    with tempfile.TemporaryDirectory() as tmp:
+        racine = pathlib.Path(tmp)
+        resultats = application.appliquer_changements(racine, [
+            {"fichier": "jamais-vu.txt", "action": "delete", "acceptes": []}
+        ])
+        assert resultats[0].statut == "pas_modifie"
+
+
+def test_suppression_refuse_un_dossier():
+    with tempfile.TemporaryDirectory() as tmp:
+        racine = pathlib.Path(tmp)
+        (racine / "sous").mkdir()
+        (racine / "sous" / "x.txt").write_text("x", encoding="utf-8")
+        resultats = application.appliquer_changements(racine, [
+            {"fichier": "sous", "action": "delete", "acceptes": []}
+        ])
+        assert resultats[0].statut == "erreur"
+        assert (racine / "sous").is_dir()  # rien n'est détruit
+
+
 def test_creation_de_fichier():
     with tempfile.TemporaryDirectory() as tmp:
         racine = pathlib.Path(tmp)

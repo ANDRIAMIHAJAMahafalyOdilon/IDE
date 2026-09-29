@@ -59,7 +59,12 @@ def verifier_serveur() -> bool:
 
 
 def creer_session(directory: str | Path, title: str | None = None) -> str:
-    """Crée une session OpenCode avec le system prompt et retourne son id."""
+    """Crée une session OpenCode et retourne son id.
+
+    Le contrat serveur est `POST /session { parentID?, title? }` : le system
+    prompt N'EST PAS accepté ici. Il est transmis à chaque tour, dans le corps
+    du message (cf. `envoyer_instruction`).
+    """
     try:
         resp = _client(15).post(
             "/session",
@@ -83,11 +88,22 @@ def creer_session(directory: str | Path, title: str | None = None) -> str:
 
 
 def envoyer_instruction(sid: str, directory: str | Path, texte: str) -> str:
-    """Envoie un tour de proposeur. Retourne le texte final de l'agent."""
+    """Envoie un tour de proposeur. Retourne le texte final de l'agent.
+
+    `system` est la clé qui fait tenir le contrat « proposeur seul » : sans
+    elle, OpenCode reçoit une consigne d'édition sans aucune interdiction
+    d'écrire et peut modifier le projet alors que l'utilisateur n'a accepté
+    qu'une proposition. Le contrat serveur
+    `POST /session/:id/message { messageID?, model?, agent?, noReply?, system?,
+    tools?, parts }` l'accepte à chaque tour — d'où l'envoi systématique.
+    """
     try:
         resp = _client().post(
             f"/session/{sid}/message",
-            json={"parts": [{"type": "text", "text": texte}]},
+            json={
+                "system": SYSTEM_PROMPT,
+                "parts": [{"type": "text", "text": texte}],
+            },
             headers={"x-opencode-directory": str(Path(directory).resolve())},
         )
         resp.raise_for_status()
@@ -177,6 +193,30 @@ def assurer_serveur(directory: str | Path) -> None:
         "serveur_indisponible",
         f"Le serveur OpenCode ne répond pas sur {OPENCODE_BASE_URL}.",
     )
+
+
+def arreter_serveur() -> None:
+    """Arrête le serveur OpenCode lancé par CE processus (`opencode serve`).
+
+    Sans cela, chaque arrêt/redémarrage du backend laisse un `opencode serve`
+    orphelin qui garde le port 4096 occupé : le redémarrage suivant échoue
+    silencieusement côté `assurer_serveur`. Un serveur déjà lancé par
+    l'utilisateur (`_SERVEUR_PROCESS is None`) n'est jamais tué.
+    """
+    global _SERVEUR_PROCESS
+    proc, _SERVEUR_PROCESS = _SERVEUR_PROCESS, None
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        proc.terminate()
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except OSError:
+            pass
+    except OSError:
+        pass
 
 
 def _sse_payload(data: str) -> dict[str, Any] | None:

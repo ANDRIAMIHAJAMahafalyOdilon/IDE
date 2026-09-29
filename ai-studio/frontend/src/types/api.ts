@@ -47,6 +47,13 @@ export interface SimulationFichier {
 export type EvenementSSE =
   | { event: "debut"; data: { session: string | null; autoris: boolean; moteur: string } }
   | { event: "texte"; data: { delta: string } }
+  | {
+      /** Un flux s'est coupé en cours de route : le client doit effacer les
+       *  deltas déjà reçus avant d'afficher ceux du moteur de secours, sinon
+       *  l'utilisateur voit une réponse tronquée collée à la suivante. */
+      event: "reprise";
+      data: { moteur: string; raison: string };
+    }
   | { event: "proposition"; data: Proposition }
   | { event: "erreur"; data: ErreurSSE }
   | { event: "fin"; data: { session: string | null; nb_fichiers: number } };

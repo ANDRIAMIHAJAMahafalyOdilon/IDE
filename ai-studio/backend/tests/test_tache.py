@@ -16,6 +16,7 @@ import tempfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # backend/
 
 from app.services import agent_tache as at  # noqa: E402
+from app.services import opencode as oc  # noqa: E402
 
 
 class FauxStdout:
@@ -394,6 +395,59 @@ def test_binaire_invalide_environ():
             raise AssertionError("ErreurTache attendue pour un binaire absent")
     finally:
         at.OPENCODE_BIN = ancien
+
+
+# ── Serveur OpenCode : system prompt et arrêt propre ────────────────────────
+
+def test_system_prompt_est_envoye_a_lagent():
+    """Le contrat « proposeur seul » ne tient que si `system` accompagne le
+    message. Sans lui, OpenCode peut écrire alors que l'utilisateur n'a validé
+    qu'une proposition. Protège contre la régression du champ retiré."""
+    capture: dict = {}
+
+    class FauxClient:
+        def post(self, url, **kw):
+            capture["url"] = url
+            capture["corps"] = kw.get("json") or {}
+            raise RuntimeError("stop")
+
+    ancien = oc._client
+    oc._client = lambda timeout=None: FauxClient()
+    try:
+        try:
+            oc.envoyer_instruction("ses_1", "C:/p", "modifie app.py")
+        except Exception:  # noqa: BLE001 — le faux client lève toujours
+            pass
+    finally:
+        oc._client = ancien
+
+    assert capture["url"].endswith("/session/ses_1/message")
+    assert capture["corps"].get("system") == oc.SYSTEM_PROMPT
+    assert "ne peux PAS" in oc.SYSTEM_PROMPT  # l'interdiction d'écrire est explicite
+
+
+def test_arreter_serveur_ne_tue_pas_un_serveur_externe():
+    """Un `opencode serve` lancé par l'utilisateur ne doit jamais être tué."""
+    oc._SERVEUR_PROCESS = None
+    oc.arreter_serveur()  # ne doit pas lever
+
+
+def test_arreter_serveur_arrete_le_processus_lance_par_le_backend():
+    import subprocess
+
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    oc._SERVEUR_PROCESS = proc
+    try:
+        oc.arreter_serveur()
+        assert oc._SERVEUR_PROCESS is None
+        assert proc.poll() is not None  # bien arrêté, pas laissé orphelin
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        oc._SERVEUR_PROCESS = None
 
 
 def _tout_executer():

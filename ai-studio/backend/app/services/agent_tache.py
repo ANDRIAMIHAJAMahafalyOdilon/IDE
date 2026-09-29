@@ -47,9 +47,29 @@ from ..config import (
 
 logger = logging.getLogger(__name__)
 
-BINAIRE_PAR_DEFAUT = (
-    r"C:\Users\Roch\AppData\Roaming\npm\node_modules\opencode-ai\bin\opencode.exe"
-)
+def _binaire_npm_global() -> str | None:
+    """Cherche opencode.exe dans le dossier global npm (portable, sans chemin en dur).
+
+    Lit `npm prefix -g` pour trouver le dossier d'installation global de npm,
+    puis construit le chemin vers opencode-ai/bin/opencode.exe. Retourne None
+    si npm est introuvable ou si le binaire n'existe pas à cet emplacement.
+    """
+    npm = shutil.which("npm")
+    if not npm:
+        return None
+    try:
+        resultat = subprocess.run(
+            [npm, "prefix", "-g"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        prefix = resultat.stdout.strip()
+        if not prefix:
+            return None
+        candidat = Path(prefix) / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
+        return str(candidat) if candidat.exists() else None
+    except Exception:  # noqa: BLE001
+        return None
 
 
 class ErreurTache(Exception):
@@ -64,7 +84,7 @@ class ErreurTache(Exception):
 # ─────────────────── Résolution du binaire OpenCode ───────────────────────
 
 def resoudre_binaire() -> str:
-    """Chemins du binaire CLI : override config, exe npm, sinon `opencode` PATH."""
+    """Chemins du binaire CLI : override config, npm global, shim PATH, sinon erreur."""
     if OPENCODE_BIN:
         if not Path(OPENCODE_BIN).exists():
             raise ErreurTache(
@@ -72,8 +92,10 @@ def resoudre_binaire() -> str:
                 f"OPENCODE_BIN configuré mais introuvable : {OPENCODE_BIN!r}",
             )
         return OPENCODE_BIN
-    if Path(BINAIRE_PAR_DEFAUT).exists():
-        return BINAIRE_PAR_DEFAUT
+    # 1) Résolution portable via `npm prefix -g` (aucun chemin utilisateur en dur).
+    npm_global = _binaire_npm_global()
+    if npm_global:
+        return npm_global
     TROUVE = shutil.which("opencode")
     if TROUVE and Path(TROUVE).suffix.lower() == ".exe":
         return TROUVE

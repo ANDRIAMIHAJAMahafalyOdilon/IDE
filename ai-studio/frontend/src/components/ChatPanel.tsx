@@ -14,6 +14,7 @@ import {
 } from "../api/client";
 import type { ReponseDocuments } from "../api/client";
 import { useDiscussions } from "../store/discussions";
+import type { MessageDisc } from "../store/discussions";
 import { useStudio } from "../store/studio";
 import type {
   EvenementTache,
@@ -40,7 +41,7 @@ const ETIQUETTES_ERREUR: Record<string, string> = {
 };
 
 interface BulleChatProps {
-  message: { role: "user" | "assistant"; texte: string };
+  message: MessageDisc;
   dernier: boolean;
   busy: boolean;
 }
@@ -364,6 +365,13 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           useDiscussions.getState().fixer(id, evt.data.session ?? id, evt.data.moteur);
         } else if (evt.event === "texte") {
           useDiscussions.getState().fusionnerDelta(id, evt.data.delta);
+        } else if (evt.event === "reprise") {
+          // Le flux précédent s'est coupé : on efface sa réponse partielle
+          // avant que le moteur de secours ne diffuse la sienne, sinon
+          // l'utilisateur verrait les deux textes collés l'un à l'autre.
+          const etat = useDiscussions.getState();
+          etat.viderReponseEnCours(id);
+          etat.fixer(id, etat.sessions.find((x) => x.id === id)?.backend ?? id, evt.data.moteur);
         } else if (evt.event === "erreur") {
           useDiscussions.getState().retirerAssistantVide(id);
           setErreurChat({
@@ -709,7 +717,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             </div>
             {active!.messages.map((m, i) => (
               <BulleChat
-                key={i}
+                key={m.id}
                 message={m}
                 dernier={i === active!.messages.length - 1}
                 busy={busy}
@@ -737,9 +745,9 @@ export function ChatPanel({ projet }: ChatPanelProps) {
               : "L'agent propose des modifications de fichiers ci-dessous — valide bloc par bloc puis applique."}
           </div>
         )}
-        {!enChat && messagesEditVisibles.map((message, index) => (
+        {!enChat && messagesEditVisibles.map((message) => (
           <BulleChat
-            key={`edit-history-${index}`}
+            key={message.id}
             message={message}
             dernier={false}
             busy={false}

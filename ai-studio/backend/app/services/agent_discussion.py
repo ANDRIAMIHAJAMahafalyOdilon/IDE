@@ -8,12 +8,16 @@ optionnel et en LECTURE SEULE. D'où l'absence totale de dépendance à
 
 from __future__ import annotations
 
-from itertools import chain
+import logging
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
 from . import moteurs, workspace
 from ..config import ARBRE_CONTEXTE_MAX, CONTEXTE_MAX_CAR, FICHIERS_CONTEXTE_MAX, MEMOIRE_ECHANGES_MAX
+
+# WARNING/ERROR et non INFO : aucune configuration de logging dans ce projet,
+# racine uvicorn en WARNING. Voir le commentaire détaillé dans `moteurs.py`.
+logger = logging.getLogger("ai_studio.discussion")
 
 SYSTEME = (
     "Tu es un assistant intégré à un éditeur de code et un assistant d'étude. "
@@ -206,29 +210,94 @@ def _premier_delta(flux: Iterator[str]) -> str | None:
 MoteurFlux = Callable[[str], Iterator[str]]
 
 
-def demarrer_reponse(prompt: str) -> tuple[str, Iterator[str]]:
-    """Démarre le premier moteur qui produit un token. Retourne (moteur, flux).
+def _engins() -> list[tuple[str, MoteurFlux]]:
+    """Chaîne de repli du Chat, résolue à chaque appel.
 
-    Le premier token est « épié » pour choisir le moteur : on ne bascule de
-    Gemini vers Groq que si Gemini échoue AVANT le moindre token (sinon une
-    sortie partielle serait déjà affichée). Lève ErreurMoteur si tout échoue.
+    Volontairement construite à la volée et non figée au chargement du module :
+    une liste constante capturerait les objets fonction d'origine, et toute
+    substitution de `moteurs.gemini_flux` (tests, bascule de moteur) serait
+    silencieusement ignorée.
     """
-    engins: list[tuple[str, MoteurFlux]] = [
-        ("gemini", moteurs.gemini_flux),
-        ("groq", moteurs.groq_flux),
-    ]
+    return [("gemini", moteurs.gemini_flux), ("groq", moteurs.groq_flux)]
+
+
+def stream_reponse(prompt: str) -> Iterator[tuple[str, Any]]:
+    """Diffuse la réponse avec basculement automatique, SANS coupure.
+
+    Rend des couples ``(type, charge)`` :
+
+    ``("moteur", nom)``
+        Premier moteur retenu, émis une seule fois, avant tout token.
+    ``("delta", texte)``
+        Fragment de réponse à afficher.
+    ``("reprise", (nouveau_moteur, raison))``
+        Le moteur courant a lâché APRÈS avoir déjà streamed. L'appelant doit
+        alors EFFACER les deltas déjà reçus et repartir de zéro : c'est ce qui
+        évite qu'une réponse tronquée soit collée devant la réponse du moteur
+        de secours. Aucun ``("moteur")`` n'est réémis, ``reprise`` porte déjà
+        le nouveau nom (l'interface met à jour son étiquette avec).
+
+    Le basculement ne se limite donc pas au tout début : une coupure réseau,
+    un quota dépassé ou un délai dépassé en pleine génération relancent la
+    réponse depuis le début avec le moteur suivant. Le seul cas non récupérable
+    est l'épuisement de la chaîne, qui lève `ErreurMoteur`.
+    """
     erreurs: list[str] = []
-    for nom, flux_fn in engins:
+    engins = _engins()
+    i = 0
+    annonce = False
+    while i < len(engins):
+        nom, flux_fn = engins[i]
+        # ── Sélection du moteur : jusqu'au premier token inclus ──────────────
         try:
             flux = flux_fn(prompt)
             premier = _premier_delta(flux)
         except moteurs.ErreurMoteur as exc:
             erreurs.append(f"{exc.code} ({nom}) : {exc.message}")
+            logger.error(
+                "moteur_refuse moteur=%s code=%s avant_premier_chunk=oui",
+                nom,
+                exc.code,
+            )
+            i += 1
             continue
         if premier is None:
             erreurs.append(f"{nom} : réponse vide.")
+            i += 1
             continue
-        return nom, chain([premier], flux)
+
+        if not annonce:
+            yield ("moteur", nom)
+            annonce = True
+
+        # ── Diffusion, avec sortie de secours si le flux se coupe ───────────
+        abandonnes = 1  # le premier delta a déjà été yieldé
+        try:
+            yield ("delta", premier)
+            for delta in flux:
+                if delta:
+                    abandonnes += 1
+                    yield ("delta", delta)
+        except moteurs.ErreurMoteur as exc:
+            erreurs.append(f"{exc.code} ({nom}) : {exc.message}")
+            i += 1
+            reste = engins[i:]
+            if reste:
+                # WARNING et non INFO : visible dans uvicorn.log sans
+                # configuration de logging (cf. commentaire de moteurs.py).
+                # Ni le prompt ni les chunks abandonnés ne sont journalisés.
+                logger.warning(
+                    "bascule de=%s vers=%s code=%s chunks_abandones=%d",
+                    nom,
+                    reste[0][0],
+                    exc.code,
+                    abandonnes,
+                )
+                yield ("reprise", (reste[0][0], f"{nom} : {exc.message}"))
+            continue
+        return
+
+    logger.error("chaine_epuisee erreurs=%d", len(erreurs))
     raise moteurs.ErreurMoteur(
         "moteur_indisponible",
         "Aucun moteur n'a produit de réponse : " + " | ".join(erreurs),

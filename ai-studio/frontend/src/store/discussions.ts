@@ -3,6 +3,8 @@ import { persist } from "zustand/middleware";
 import type { ModeAgent } from "../types/api";
 
 export interface MessageDisc {
+  /** Identifiant stable : clé React et cible de réconciliation. */
+  id: string;
   role: "user" | "assistant";
   texte: string;
 }
@@ -28,6 +30,19 @@ function genererId() {
   );
 }
 
+/** Identifiant stable d'un message. `crypto.randomUUID` exige un contexte
+ *  sécurisé (localhost ou https) : on retombe sinon sur un suffixe aléatoire. */
+export function genererIdMessage(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return (
+    "msg-" +
+    Math.random().toString(36).slice(2, 10) +
+    Date.now().toString(36)
+  );
+}
+
 function titrer(texte: string): string {
   const plat = texte.replace(/\s+/g, " ").trim();
   return plat.length > 48 ? plat.slice(0, 48) + "…" : plat;
@@ -42,6 +57,9 @@ interface EtatDiscussions {
   supprimer: (id: string) => void;
   ajouterMessage: (id: string, role: "user" | "assistant", texte: string) => void;
   fusionnerDelta: (id: string, delta: string) => void;
+  /** Vide la réponse en cours d'un assistant : utilisé sur `reprise`, quand le
+   *  flux a été coupé et que le moteur de secours relance la réponse. */
+  viderReponseEnCours: (id: string) => void;
   fixer: (id: string, backend: string, moteur: string) => void;
   retirerAssistantVide: (id: string) => void;
 }
@@ -103,7 +121,11 @@ export const useDiscussions = create<EtatDiscussions>()(
               x.titre === TITRE_PAR_DEFAUT && role === "user" && texte.trim()
                 ? titrer(texte)
                 : x.titre;
-            return { ...x, titre, messages: [...x.messages, { role, texte }] };
+            return {
+              ...x,
+              titre,
+              messages: [...x.messages, { id: genererIdMessage(), role, texte }],
+            };
           }),
         })),
 
@@ -118,6 +140,21 @@ export const useDiscussions = create<EtatDiscussions>()(
                 ...dernier,
                 texte: dernier.texte + delta,
               };
+            }
+            return { ...x, messages };
+          }),
+        })),
+
+      viderReponseEnCours: (id) =>
+        set((s) => ({
+          sessions: s.sessions.map((x) => {
+            if (x.id !== id) return x;
+            const messages = [...x.messages];
+            const dernier = messages[messages.length - 1];
+            // Seul le dernier message assistant encore en cours est vidé :
+            // l'historique des réponses terminées n'est jamais touché.
+            if (dernier?.role === "assistant") {
+              messages[messages.length - 1] = { ...dernier, texte: "" };
             }
             return { ...x, messages };
           }),
@@ -143,7 +180,7 @@ export const useDiscussions = create<EtatDiscussions>()(
     }),
     {
       name: "ai-studio-discussions",
-      version: 2,
+      version: 3,
       migrate: (etatInconnu) => {
         // Les versions précédentes n'avaient qu'un historique global. On le
         // conserve dans Chat afin qu'une mise à jour ne fasse rien disparaître.
@@ -153,6 +190,12 @@ export const useDiscussions = create<EtatDiscussions>()(
         const sessions = (ancien.sessions ?? []).map((session) => ({
           ...session,
           mode: session.mode === "edit" ? "edit" : "chat",
+          // v3 : chaque message reçoit un identifiant stable (clé React).
+          // Les fils sauvegardés avant la v3 n'en ont pas : on les complète.
+          messages: (session.messages ?? []).map((message) => ({
+            ...message,
+            id: message.id ?? genererIdMessage(),
+          })),
         }));
         const anciensActifs = ancien.activeIds;
         return {

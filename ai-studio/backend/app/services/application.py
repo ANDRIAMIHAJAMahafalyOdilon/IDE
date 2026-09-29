@@ -53,12 +53,26 @@ def _appliquer_un(racine: Path, m: Mapping[str, Any]) -> ResultatFichier:
     # Fatal : tentative de sortie du projet -> remonte jusqu'à l'API (422).
     chemin = workspace.chemin_securise(racine, rel)
 
-    if action == "delete":
-        if chemin.exists():
-            chemin.unlink()
-        return ResultatFichier(rel, "ok")
-
     try:
+        if action == "delete":
+            # La suppression EST une écriture destructive : elle doit respecter
+            # la même péremption que l'écriture. Sans ce contrôle, valider une
+            # proposition ancienne effacerait un fichier modifié depuis.
+            if not chemin.exists():
+                return ResultatFichier(rel, "pas_modifie", "déjà absent")
+            source_hash = m.get("source_hash")
+            if source_hash and _sha(workspace.lire_fichier(chemin)) != source_hash:
+                return ResultatFichier(
+                    rel,
+                    "erreur",
+                    "fichier périmé depuis la proposition (il a changé entre-temps) : "
+                    "il n'a pas été supprimé.",
+                )
+            if chemin.is_dir():
+                return ResultatFichier(rel, "erreur", "c'est un dossier, pas un fichier")
+            chemin.unlink()
+            return ResultatFichier(rel, "ok")
+
         acceptes = list(m.get("acceptes") or [])
         if not acceptes:
             return ResultatFichier(rel, "pas_modifie")
@@ -76,5 +90,7 @@ def _appliquer_un(racine: Path, m: Mapping[str, Any]) -> ResultatFichier:
         )
     except HunksChevauchants as exc:
         return ResultatFichier(rel, "erreur", f"hunks invalides : {exc}")
+    except IsADirectoryError as exc:
+        return ResultatFichier(rel, "erreur", f"c'est un dossier, pas un fichier : {exc}")
     except OSError as exc:
         return ResultatFichier(rel, "erreur", f"erreur disque : {exc}")

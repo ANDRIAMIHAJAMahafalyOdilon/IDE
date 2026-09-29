@@ -149,5 +149,13 @@ def etat(projet: str, chemins: list[str] | None = None):
 
     `chemins` est répétable (GET /etat?chemins=a.py&chemins=b.py) ; absent =
     tout le projet.
+
+    Un projet inconnu est un 404, pas une erreur serveur : le frontend poll
+    cet endpoint et interpretait le 500 comme une panne du backend. Note :
+    `ps.etat_fichiers` ignore volontairement les chemins hors projet, donc
+    seule l'absence du projet remonte ici.
     """
-    return ps.etat_fichiers(projet, chemins)
+    try:
+        return ps.etat_fichiers(projet, chemins)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc

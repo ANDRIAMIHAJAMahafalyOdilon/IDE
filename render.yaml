@@ -1,0 +1,48 @@
+# AI Studio — déploiement Render (un seul service : API + SPA).
+#
+# Le frontend compilé est servi par FastAPI lui-même : le navigateur appelle
+# `/api/...` en relatif sur le même domaine, donc aucune entrée CORS et aucun
+# second service à synchroniser.
+#
+#   1. Pousser ces fichiers sur la branche du dépôt Render surveillée.
+#   2. Render > New > Blueprint > pointer sur ce dépôt (render.yaml est lu).
+#   3. Renseigner GEMINI_API_KEY et/ou GROQ_API_KEY dans l'onglet Environment.
+#
+# `data/` est ÉPHÉMÈRE (plan gratuit) : projets importés, documents de cours et
+# index RAG sont perdus à chaque redéploiement. Pour les conserver, monter un
+# Render Disk sur /var/data et passer DATA_DIR=/var/data.
+
+services:
+  - type: web
+    name: ai-studio
+    runtime: python
+    plan: free
+    # Racine du dépôt (le backend est dans ai-studio/backend, la SPA dans
+    # ai-studio/frontend) : PROJECT_ROOT = /opt/render/project/src/ai-studio.
+    rootDir: .
+    buildCommand: >-
+      pip install --no-cache-dir -r ai-studio/backend/requirements.txt
+      && npm ci --prefix ai-studio/frontend
+      && npm run build --prefix ai-studio/frontend
+    startCommand: exec uvicorn app.main:app --app-dir ai-studio/backend --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+    autoDeploy: true
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.8
+      # Node n'est utilisé que pour builder la SPA (npm ci / vite build), mais
+      # sa version est épinglée pour que le build soit reproductible.
+      - key: NODE_VERSION
+        value: 22.11.0
+      - key: PYTHONUNBUFFERED
+        value: "1"
+      # Chemin des données. Commenté par défaut : /opt/render/project/src est
+      # inscriptible mais purgé à chaque redéploiement.
+      # - key: DATA_DIR
+      #   value: /var/data
+      # L'agent OpenCode (mode Tâche) n'est pas installé sur Render : le mode
+      # Chat et le RAG passent par Gemini/Groq.
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
