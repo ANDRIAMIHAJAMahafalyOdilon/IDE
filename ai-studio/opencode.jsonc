@@ -1,5 +1,24 @@
 {
   "$schema": "https://opencode.ai/config.json",
   "model": "opencode/big-pickle",
-  "small_model": "opencode/mimo-v2.6-flash-free"
+  "small_model": "opencode/mimo-v2.6-flash-free",
+
+  // Le mode autonome tourne avec le `cwd` sur le PROJET DE L'UTILISATEUR, donc
+  // OpenCode y découvre sa propre config et jamais celle-ci. Cette config n'est
+  // lue que parce que le serveur est lancé avec OPENCODE_CONFIG pointant ici
+  // (cf. services/opencode.py:assurer_serveur). Ne pas compter sur
+  // l'auto-découverte.
+  "instructions": [
+    "Tu travailles dans un IDE ouvert par un utilisateur sur sa propre machine.\n\nAgis directement sur la demande. L'utilisateur attend une action, pas une enquête.\n\n- Ne parcours pas le projet, ne fais pas d'inventaire, ne liste pas les fichiers sauf si la demande le demande explicitement.\n- N'exécute AUCUNE commande si la demande peut être satisfaite en lisant et écrivant des fichiers. Une commande doit toujours être nécessaire à la demande, jamais de la curiosité.\n- Ne demande pas la permission d'explorer : tu as déjà les outils.\n- Si la demande est précise (fichier, transformation), lis ce fichier, fais la transformation, arrête-toi.\n- Va droit au but. Une réponse qui décrit ce que tu as fait suffit ; n'énumère pas les étapes.\n- Ne réécris pas un fichier si la demande ne le demande pas."
+  ],
+
+  // Par défaut tout est autorisé en lecture/écriture et les commandes partent
+  // sans confirmation : l'agent lançait git log, Get-Content et des sondes
+  // réseau sur un dossier vide. « ask » rend la commande visible et
+  // confirmable ; « deny » supprime le sous-agent, responsable des longues
+  // chaînes de « Lecture / Commande / Lecture ».
+  "permission": {
+    "bash": "ask",
+    "task": "deny"
+  }
 }

@@ -12,6 +12,7 @@ import json
 import pathlib
 import sys
 import tempfile
+from pathlib import Path
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # backend/
 
@@ -448,6 +449,107 @@ def test_arreter_serveur_arrete_le_processus_lance_par_le_backend():
         if proc.poll() is None:
             proc.kill()
         oc._SERVEUR_PROCESS = None
+
+
+def test_mapper_serveur_ne_reaffiche_pas_le_texte():
+    """Le texte ne doit apparaître qu'une fois.
+
+    OpenCode diffuse le texte d'une part en deltas puis renvoie l'instantané
+    complet de la même part. Les deux gestionnaires émettent des événements
+    `texte` : sans état partagé, la réponse complète était renvoyée une seconde
+    fois et s'affichait en triple dans le panneau.
+    """
+    racine = _racine()
+    outils: dict = {}
+
+    at.mapper_evenement_serveur({
+        "type": "message.updated",
+        "properties": {"info": {"id": "msg-1", "role": "assistant", "modelID": "m"}},
+    }, racine, outils)
+
+    deltas = [
+        {"type": "message.part.delta", "properties": {
+            "messageID": "msg-1", "partID": "prt-1", "field": "text", "delta": d}}
+        for d in ("Fusionne ", "Session + Type ", "en une colonne.")
+    ]
+    snapshot = {
+        "type": "message.part.updated",
+        "properties": {"part": {
+            "id": "prt-1", "messageID": "msg-1", "type": "text",
+            "text": "Fusionne Session + Type en une colonne.",
+        }},
+    }
+
+    sortie = []
+    for evt in [*deltas, snapshot]:
+        sortie += at.mapper_evenement_serveur(evt, racine, outils)
+
+    texte = "".join(d["delta"] for nom, d in sortie if nom == "texte")
+    assert texte == "Fusionne Session + Type en une colonne.", texte
+    assert len([nom for nom, _ in sortie if nom == "texte"]) == 3
+
+
+def test_mapper_serveur_texte_reecrit_ne_double_pas():
+    """Un texte réécrit (et non allongé) ne doit pas être renvoyé en entier."""
+    racine = _racine()
+    outils: dict = {}
+    at.mapper_evenement_serveur({
+        "type": "message.updated",
+        "properties": {"info": {"id": "msg-2", "role": "assistant", "modelID": "m"}},
+    }, racine, outils)
+
+    sortie = at.mapper_evenement_serveur({
+        "type": "message.part.delta",
+        "properties": {"messageID": "msg-2", "partID": "p", "field": "text",
+                       "delta": "bonne reponse"},
+    }, racine, outils)
+    sortie += at.mapper_evenement_serveur({
+        "type": "message.part.updated",
+        "properties": {"part": {"id": "p", "messageID": "msg-2", "type": "text",
+                                "text": "autre chose"}},
+    }, racine, outils)
+
+    assert [d for nom, d in sortie if nom == "texte"] == [{"delta": "bonne reponse"}]
+
+
+def test_serveur_recoit_la_config_de_lapplication():
+    """Le serveur doit démarrer avec OPENCODE_CONFIG pointant sur notre config.
+
+    Son `cwd` est le projet de l'utilisateur, donc OpenCode y découvre la config
+    de CE projet et ignore la nôtre. Sans cette variable, l'agent tourne avec les
+    valeurs par défaut (tout autorisé, aucune consigne) et il explore au lieu
+    d'agir.
+    """
+    racine = _racine()
+    captures: dict = {}
+
+    class FauxProcessus:
+        def poll(self):
+            return None
+
+    def faux_popen(*args, **kwargs):
+        captures["env"] = kwargs.get("env") or {}
+        captures["cwd"] = kwargs.get("cwd")
+        return FauxProcessus()
+
+    reel_popen = oc.subprocess.Popen
+    reel_verif = oc.verifier_serveur
+    reel_bin = oc._serveur_binaire
+    etats = iter([False, True, True])
+    oc.subprocess.Popen = faux_popen
+    oc.verifier_serveur = lambda: next(etats, True)
+    oc._serveur_binaire = lambda: "opencode"
+    try:
+        oc.assurer_serveur(racine)
+    finally:
+        oc.subprocess.Popen = reel_popen
+        oc.verifier_serveur = reel_verif
+        oc._serveur_binaire = reel_bin
+
+    assert captures["cwd"] == str(racine.resolve())
+    assert "OPENCODE_CONFIG" in captures["env"], captures["env"].keys()
+    assert Path(captures["env"]["OPENCODE_CONFIG"]).name == "opencode.jsonc"
+    assert Path(captures["env"]["OPENCODE_CONFIG"]).is_file()
 
 
 def _tout_executer():

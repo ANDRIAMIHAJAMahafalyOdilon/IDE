@@ -441,6 +441,14 @@ def mapper_evenement_serveur(
                 "title": "Raisonnement OpenCode",
                 "description": delta,
             })]
+        # Le texte déjà diffusé est mémorisé ICI, sous la clé de la partie ET
+        # sous celle du message. Sans cela, le gestionnaire `message.part.updated`
+        # qui reçoit l'instantané complet rejouait tout le texte une seconde
+        # fois : le backend renvoyait deux fois chaque réponse.
+        cle = str(props.get("partID") or props.get("partId") or message_id)
+        for k in {cle, message_id}:
+            if len(textes.get(k, "")) < len(textes.get(cle, "")) + len(delta):
+                textes[k] = textes.get(cle, "") + delta
         return [("texte", {"delta": delta})]
 
     if genre == "message.part.updated":
@@ -452,9 +460,19 @@ def mapper_evenement_serveur(
 
         if part_type == "text" and roles.get(message_id) == "assistant":
             texte = str(part.get("text") or "")
-            ancien = str(textes.get(str(part.get("id") or message_id)) or "")
-            delta = texte[len(ancien):] if texte.startswith(ancien) else texte
-            textes[str(part.get("id") or message_id)] = texte
+            # `message.part.delta` peut avoir mémorisé l'état sous la clé de la
+            # partie ou sous celle du message selon la forme de l'événement. On
+            # retient la plus longue des deux, sinon l'instantané complet rejouait
+            # du texte déjà diffusé. Même règle de croissance que `mapper_ligne` :
+            # si le texte a été réécrit plutôt qu'allongé, on n'émet rien plutôt
+            # que de dupliquer la réponse dans le panneau.
+            cle = str(part.get("id") or message_id)
+            ancien = max((textes.get(cle, ""), textes.get(message_id, "")), key=len)
+            if len(texte) > len(ancien):
+                textes[cle] = texte
+                if message_id:
+                    textes[message_id] = texte
+            delta = texte[len(ancien):] if texte.startswith(ancien) else ""
             return [("texte", {"delta": delta})] if delta else sorties
 
         if part_type in {"reasoning", "thinking"}:

@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 
 import httpx
 
-from ..config import OPENCODE_BASE_URL, OPENCODE_TIMEOUT
+from ..config import OPENCODE_BASE_URL, OPENCODE_CONFIG, OPENCODE_TIMEOUT
 
 logger = logging.getLogger(__name__)
 
@@ -165,6 +165,11 @@ def assurer_serveur(directory: str | Path) -> None:
         binaire = _serveur_binaire()
         env = os.environ.copy()
         env.setdefault("NO_COLOR", "1")
+        # La config de l'application porte les instructions et les permissions de
+        # l'agent. Elle n'est pas auto-découverte : le `cwd` du serveur est le
+        # projet de l'utilisateur, donc OpenCode lirait la config de CE projet.
+        if OPENCODE_CONFIG.is_file():
+            env["OPENCODE_CONFIG"] = str(OPENCODE_CONFIG.resolve())
         _SERVEUR_PROCESS = subprocess.Popen(
             [binaire, "serve", "--hostname", hote, "--port", str(port)],
             cwd=str(Path(directory).resolve()),

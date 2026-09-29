@@ -45,6 +45,16 @@ OPENCODE_BIN = os.getenv("OPENCODE_BIN", "")
 # les projets ouverts sous data/projets/ ou en mode DIRECT ne possèdent pas
 # forcément leur propre opencode.jsonc.
 OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/big-pickle")
+# Config OpenCode de l'application (opencode.jsonc à la racine de ai-studio/).
+# Elle porte les instructions de conduite de l'agent et ses permissions.
+# Elle DOIT être passée au serveur via la variable OPENCODE_CONFIG : le serveur
+# est lancé avec `cwd` sur le projet de l'utilisateur, or OpenCode y découvre
+# la config de CE projet et ignore donc la nôtre. Sans ce env var, le serveur
+# tourne avec les valeurs par défaut — tout autorisé, aucune consigne de
+# conduite — et l'agent explore le projet au lieu d'agir.
+OPENCODE_CONFIG = Path(
+    os.getenv("OPENCODE_CONFIG", str(PROJECT_ROOT / "opencode.jsonc"))
+)
 # Durée maximale d'une tâche agent autonome (secondes).
 TACHE_TIMEOUT = float(os.getenv("TACHE_TIMEOUT", "1200"))
 # Longueur maximale d'un résumé de sortie d'outil (events `outil`).
