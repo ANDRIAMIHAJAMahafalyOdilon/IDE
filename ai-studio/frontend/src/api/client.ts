@@ -195,6 +195,17 @@ export async function importerProjet(fichier: File, nom?: string): Promise<Proje
   return _json<Projet>("/api/projects/import", { method: "POST", body: corps });
 }
 
+/** Télécharge le projet en zip : seul moyen de récupérer hors du serveur le
+ *  travail de l'agent (symétrique de `importerProjet`). */
+export function telechargerProjet(projet: string): void {
+  const lien = document.createElement("a");
+  lien.href = `/api/projects/${encodeURIComponent(projet)}/export`;
+  lien.download = "";
+  document.body.appendChild(lien);
+  lien.click();
+  lien.remove();
+}
+
 /** Aperçu (sans ouverture) d'un dossier local : validation + échantillon filtré. */
 export async function apercuProjetLocal(chemin: string): Promise<ApercuDossier> {
   const res = await fetch("/api/projects/preview-local", {

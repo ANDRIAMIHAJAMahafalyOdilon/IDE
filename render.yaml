@@ -9,8 +9,9 @@
 #   3. Renseigner GEMINI_API_KEY et/ou GROQ_API_KEY dans l'onglet Environment.
 #
 # `data/` est ÉPHÉMÈRE (plan gratuit) : projets importés, documents de cours et
-# index RAG sont perdus à chaque redéploiement. Pour les conserver, monter un
-# Render Disk sur /var/data et passer DATA_DIR=/var/data.
+# index RAG sont perdus à chaque redéploiement — donc le travail de l'agent
+# aussi. Pour les conserver, monter un Render Disk sur /var/data et passer
+# DATA_DIR=/var/data (Dashboard > Disks).
 
 services:
   - type: web
@@ -24,6 +25,7 @@ services:
       pip install --no-cache-dir -r ai-studio/backend/requirements.txt
       && npm ci --prefix ai-studio/frontend
       && npm run build --prefix ai-studio/frontend
+      && npm i -g opencode-ai@1.18.33
     startCommand: exec uvicorn app.main:app --app-dir ai-studio/backend --host 0.0.0.0 --port $PORT
     healthCheckPath: /health
     autoDeploy: true
@@ -40,8 +42,11 @@ services:
       # inscriptible mais purgé à chaque redéploiement.
       # - key: DATA_DIR
       #   value: /var/data
-      # L'agent OpenCode (mode Tâche) n'est pas installé sur Render : le mode
-      # Chat et le RAG passent par Gemini/Groq.
+      # L'agent OpenCode est installé par le buildCommand ci-dessus : le mode
+      # Tâche fonctionne donc sur Render, sur les projets importés dans data/.
+      # Ces clés restent OPTIONNELLES : sans elles, seuls OpenCode et l'éditeur
+      # répondent, et le RAG est indisponible (les embeddings passent par
+      # Gemini). Les renseigner laisse vos quotas Gemini/Groq à votre charge.
       - key: GEMINI_API_KEY
         sync: false
       - key: GROQ_API_KEY

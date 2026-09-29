@@ -9,7 +9,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Form, HTTPException, UploadFile
+from fastapi import APIRouter, BackgroundTasks, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 
 from ..services import projets as ps
 from ..services.workspace import CheminHorsProjet, racine_projet
@@ -93,6 +94,28 @@ def ouvrir_local(payload: dict[str, Any]):
         return ps.ouvrir_dossier_local((payload or {}).get("chemin", ""))
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@router.get("/{projet}/export")
+def exporter(projet: str, background: BackgroundTasks):
+    """Archive zip du projet, prête à être téléchargée.
+
+    Symétrique de `POST /import` : c'est ce qui referme la boucle quand
+    l'agent a modifié des fichiers dans le cloud. L'archive part dans un
+    dossier racine homonyme au projet, donc elle se réimporte telle quelle.
+    """
+    try:
+        chemin, nom_fichier = ps.exporter_archive(projet)
+    except CheminHorsProjet as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    background.add_task(ps.supprimer_temporaire, chemin)
+    return FileResponse(
+        chemin, media_type="application/zip", filename=nom_fichier
+    )
 
 
 @router.get("/{projet}/tree")

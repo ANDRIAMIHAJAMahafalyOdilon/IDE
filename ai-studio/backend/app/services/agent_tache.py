@@ -48,11 +48,13 @@ from ..config import (
 logger = logging.getLogger(__name__)
 
 def _binaire_npm_global() -> str | None:
-    """Cherche opencode.exe dans le dossier global npm (portable, sans chemin en dur).
+    """Cherche le binaire OpenCode dans le dossier global npm (portable, sans chemin en dur).
 
     Lit `npm prefix -g` pour trouver le dossier d'installation global de npm,
-    puis construit le chemin vers opencode-ai/bin/opencode.exe. Retourne None
-    si npm est introuvable ou si le binaire n'existe pas à cet emplacement.
+    puis regarde `opencode-ai/bin/opencode.exe` (Windows) et
+    `opencode-ai/bin/opencode` (Linux/macOS : le script `postinstall` du paquet
+    y dépose le binaire natif de la plateforme). Retourne None si npm est
+    introuvable ou si aucun binaire n'existe à cet emplacement.
     """
     npm = shutil.which("npm")
     if not npm:
@@ -66,8 +68,12 @@ def _binaire_npm_global() -> str | None:
         prefix = resultat.stdout.strip()
         if not prefix:
             return None
-        candidat = Path(prefix) / "node_modules" / "opencode-ai" / "bin" / "opencode.exe"
-        return str(candidat) if candidat.exists() else None
+        base = Path(prefix) / "node_modules" / "opencode-ai" / "bin"
+        for nom in ("opencode.exe", "opencode"):
+            candidat = base / nom
+            if candidat.exists():
+                return str(candidat)
+        return None
     except Exception:  # noqa: BLE001
         return None
 
@@ -97,7 +103,11 @@ def resoudre_binaire() -> str:
     if npm_global:
         return npm_global
     TROUVE = shutil.which("opencode")
-    if TROUVE and Path(TROUVE).suffix.lower() == ".exe":
+    suffixe = Path(TROUVE).suffix.lower() if TROUVE else ""
+    # POSIX : `which` renvoie déjà le binaire natif, sans extension ni shim.
+    if TROUVE and suffixe == ".exe":
+        return TROUVE
+    if TROUVE and os.name != "nt":
         return TROUVE
     # Shim .cmd/.ps1 npm : on relit le contenu et on extrait le .exe réel.
     if TROUVE:

@@ -1,3 +1,4 @@
+import { telechargerProjet } from "../api/client";
 import { useStudio } from "../store/studio";
 
 /** Sélecteur de projet dans l'entête : liste des projets déjà ouverts.
@@ -25,6 +26,14 @@ export function ProjetSelect() {
           </option>
         ))}
       </select>
+      <button
+        className="pj-export"
+        onClick={() => projet && telechargerProjet(projet)}
+        disabled={!projet}
+        title="Télécharger le projet en zip"
+      >
+        ↓ zip
+      </button>
     </div>
   );
 }

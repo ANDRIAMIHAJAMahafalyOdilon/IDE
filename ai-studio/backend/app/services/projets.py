@@ -185,6 +185,43 @@ def importer_archive(binaire: bytes, nom: str | None = None) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def exporter_archive(nom: str) -> tuple[Path, str]:
+    """Zippe le projet dans un fichier temporaire.
+
+    Retourne (chemin_du_zip, nom_telechargeable). C'est le pendant de
+    `importer_archive` : sans lui, un projet modifié par l'agent dans le cloud
+    resterait prisonnier du serveur, faute de pouvoir le récupérer.
+
+    L'archive est écrite sur disque (et non en mémoire) pour ne pas peser sur
+    le Workers : le fichier est supprimé par l'appelant via `supprimer_temporaire`.
+    """
+    # `projet_existant` et non `racine_projet` : ce dernier *crée* le dossier
+    # s'il manque, et exporter un projet inexistant ne doit pas laisser de
+    # répertoire vide derrière soi — il doit répondre 404.
+    racine = projet_existant(nom)
+    descripteur, brut = tempfile.mkstemp(suffix=".zip")
+    os.close(descripteur)
+    chemin = Path(brut)
+    dossier = _slug(nom)
+    with zipfile.ZipFile(chemin, "w", zipfile.ZIP_DEFLATED) as z:
+        for src in racine.rglob("*"):
+            if src.is_dir():
+                continue
+            rel = src.relative_to(racine)
+            if any(part in IGNORE_DOSSIERS for part in rel.parts):
+                continue
+            z.write(src, Path(dossier) / rel)
+    return chemin, f"{dossier}.zip"
+
+
+def supprimer_temporaire(chemin: Path) -> None:
+    """Supprime le zip d'export après envoi (tâche de fond du FileResponse)."""
+    try:
+        chemin.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
 def _noeuds(racine: Path, dossier: Path, flt) -> list[dict]:
     """Construit l'arborescence imbriquée (dossiers d'abord, tri alpha).
 

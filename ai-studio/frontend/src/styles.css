@@ -396,6 +396,25 @@ select {
   color: var(--ko);
 }
 
+/* Bouton d'export zip, à côté du sélecteur de projet. */
+.pj-export {
+  height: 28px;
+  padding: 0 8px;
+  font-size: 11px;
+  background: var(--bg-4);
+  color: var(--text-1);
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  cursor: pointer;
+}
+.pj-export:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.pj-export:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
 /* Explorateur de dossier serveur (bouton « ＋ » du composeur edit) — panneau overlay. */
 .pj-explorateur {
   display: flex;
