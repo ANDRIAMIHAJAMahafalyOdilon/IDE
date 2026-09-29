@@ -258,6 +258,12 @@ export async function ouvrirProjetLocal(chemin: string): Promise<Projet> {
   return (await res.json()) as Projet;
 }
 
+/** Quelles fonctions sont utilisables ici. Sur une instance cloud,
+ *  `dossier_local` est faux : le disque de l'utilisateur n'est pas accessible. */
+export function lireCapacites(): Promise<{ dossier_local: boolean }> {
+  return _json<{ dossier_local: boolean }>("/api/system/capacites");
+}
+
 /** Ouvre la VRAIE fenêtre Windows « Sélectionner un dossier » (tkinter) et
  *  renvoie le chemin choisi, ou "" si annulé. Le backend valide le chemin
  *  avant de répondre (même garde-fou qu'open-local). */

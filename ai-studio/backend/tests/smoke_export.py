@@ -96,7 +96,7 @@ def main() -> int:
           f"réimport -> {r2.status_code} {r2.json()}")
 
     print()
-    print("ECHEC :", echecs if echecs else "aucun")
+    print("RESULTAT :", "ECHEC " + repr(echecs) if echecs else "OK, aucun échec")
     return 1 if echecs else 0
 
 

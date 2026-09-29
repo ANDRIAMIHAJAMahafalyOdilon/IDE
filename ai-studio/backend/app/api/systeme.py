@@ -6,12 +6,44 @@ boîtes de dialogue Windows natives.
 
 from __future__ import annotations
 
+import sys
+
 from fastapi import APIRouter, HTTPException
 
 from ..services.dialogues import choisir_dossier_natif
 from ..services.registre import valider_chemin_local
 
 router = APIRouter(prefix="/api/system", tags=["system"])
+
+
+def _tkinter_disponible() -> bool:
+    """Vrai seulement si cet interpréteur peut ouvrir une vraie fenêtre système.
+
+    Le disque local n'a de sens que sur la machine de l'utilisateur : une
+    instance cloud (Linux, ou Python sans Tk) répond 503 sur ces endpoints.
+    Le frontend s'en sert pour ne pas afficher de boutons morts.
+    """
+    if not sys.platform.startswith("win"):
+        return False
+    try:
+        import tkinter  # noqa: F401
+    except Exception:  # noqa: BLE001
+        return False
+    return True
+
+
+@router.get("/capacites")
+def capacites():
+    """Lesquelles des fonctions dépendent de la machine locale de l'utilisateur.
+
+    `dossier_local` couvre tout ce qui lit le disque du poste : fenêtre
+    système, aperçu et ouverture d'un projet hors des données du serveur.
+    Le reste (import, export, agent, chat) fonctionne partout.
+    """
+    return {
+        "dossier_local": _tkinter_disponible(),
+        "plateforme": sys.platform,
+    }
 
 
 @router.post("/choisir-dossier")

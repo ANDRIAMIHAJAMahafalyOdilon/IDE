@@ -15,10 +15,12 @@ export default function App() {
   const projet = useStudio((s) => s.projet);
   const modeAgent = useStudio((s) => s.modeAgent);
   const chargerProjets = useStudio((s) => s.chargerProjets);
+  const chargerCapacites = useStudio((s) => s.chargerCapacites);
 
   useEffect(() => {
     void chargerProjets();
-  }, [chargerProjets]);
+    void chargerCapacites();
+  }, [chargerProjets, chargerCapacites]);
 
   function basculerTheme() {
     const suivant = theme === "sombre" ? "clair" : "sombre";

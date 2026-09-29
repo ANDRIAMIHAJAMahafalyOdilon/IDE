@@ -280,6 +280,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   // Ouverture du dossier à modifier (edit) : le « ＋ » ouvre la VRAIE fenêtre
   // Windows via le backend (aucune copie : open-local référence le disque tel quel).
   const [erreurDossier, setErreurDossier] = useState<string | null>(null);
+  const dossierLocal = useStudio((s) => s.dossierLocal);
   const ouvrirDossierLocal = useStudio((s) => s.ouvrirDossierLocal);
 
   // Mode biseau de la fenêtre système : la requête reste ouverte le temps du
@@ -954,16 +955,18 @@ export function ChatPanel({ projet }: ChatPanelProps) {
       ) : (
         <div className="chat-bar-chat">
           <div className="composer">
-            <div className="composer-plus-wrap">
-              <button
-                className="composer-plus"
-                onClick={() => void choisirDossierViaFenetre()}
-                disabled={busy || choisitDossier}
-                title="Ouvrir une fenêtre Windows pour choisir le dossier à modifier (édition directe, aucune copie)"
-              >
-                {choisitDossier ? "…" : "＋"}
-              </button>
-            </div>
+            {dossierLocal && (
+              <div className="composer-plus-wrap">
+                <button
+                  className="composer-plus"
+                  onClick={() => void choisirDossierViaFenetre()}
+                  disabled={busy || choisitDossier}
+                  title="Ouvrir une fenêtre Windows pour choisir le dossier à modifier (édition directe, aucune copie)"
+                >
+                  {choisitDossier ? "…" : "＋"}
+                </button>
+              </div>
+            )}
             <input
               className="composer-champ"
               value={message}

@@ -3,6 +3,7 @@ import { persist } from "zustand/middleware";
 import {
   arbreProjet,
   ecrireFichier,
+  lireCapacites,
   lireFichier,
   listerProjets,
   ouvrirProjetLocal,
@@ -26,7 +27,11 @@ interface EtatStudio {
   erreur: string | null;
   /** Mode courant du panneau agent : drive aussi la liste historique séparée. */
   modeAgent: ModeAgent;
+  /** Le backend peut-il lire le disque de l'utilisateur (fenêtre Windows) ?
+   *  Faux sur une instance cloud : les boutons de disque local sont masqués. */
+  dossierLocal: boolean;
   setModeAgent: (mode: ModeAgent) => void;
+  chargerCapacites: () => Promise<void>;
   chargerProjets: () => Promise<void>;
   changerProjet: (projet: string) => Promise<void>;
   ouvrirDossierLocal: (chemin: string) => Promise<Projet>;
@@ -51,7 +56,19 @@ export const useStudio = create<EtatStudio>()(
       dirty: {},
       erreur: null,
       modeAgent: "chat",
+      // Optimiste : la capacité réelle arrive au premier aller-retour. Préserve
+      // le comportement local exact plutôt que de faire clignoter le bouton.
+      dossierLocal: true,
       setModeAgent: (modeAgent) => set({ modeAgent }),
+
+      chargerCapacites: async () => {
+        try {
+          const c = await lireCapacites();
+          set({ dossierLocal: c.dossier_local });
+        } catch {
+          /* le backend ne sait pas répondre : on garde l'optimiste */
+        }
+      },
 
       chargerProjets: async () => {
         try {
