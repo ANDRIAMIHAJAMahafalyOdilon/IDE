@@ -17,11 +17,11 @@ import re
 import threading
 from pathlib import Path
 
-from ..config import DATA_DIR, PROJETS_DIR, PROJECT_ROOT
+from ..config import BUNDLE_DIR, DATA_DIR, PROJETS_DIR
 
 # Répertoires que le registre ne gère pas (protection ultime, indépendante du
 # contenu du .gitignore) : impossible d'ouvrir un dossier système en mode direct.
-_AUTREFOIS = (DATA_DIR, PROJETS_DIR, PROJECT_ROOT)
+_AUTREFOIS = (DATA_DIR, PROJETS_DIR, BUNDLE_DIR)
 
 # Variables d'environnement dont la VALEUR est un dossier système à refuser ainsi
 # que tous ses sous-dossiers.

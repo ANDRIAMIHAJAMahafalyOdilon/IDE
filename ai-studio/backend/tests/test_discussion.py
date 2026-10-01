@@ -12,6 +12,7 @@ import json
 import pathlib
 import sys
 import tempfile
+import time as _time
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # backend/
 
@@ -458,10 +459,18 @@ def test_purge_taches_priorise_les_terminees_par_ordre_chronologique():
     maximum = agent.MAX_ENTREES_MEMOIRE
     agent.MAX_ENTREES_MEMOIRE = 3
     try:
+        # `creee` doit être exprimé sur l'HORLOGE MONOTONIQUE comme le fait
+        # `_purger`, et non en 0, 1, 2, 3. Avec des valeurs arbitraires, le test
+        # passait tant que la machine avait moins de TTL_MEMOIRE_SECONDES
+        # (24 h) d'uptime — la limite était alors négative, donc aucune tâche
+        # n'était purgée par TTL et seul le plafond de taille s'appliquait. Passé
+        # 24 h d'uptime, la limite devient positive, toutes les tâches tombent
+        # sous le seuil et le test échoue : il dépendait de l'âge de la machine.
+        maintenant = _time.monotonic()
         for i in range(4):
             etat = agent.EtatTache("projet", f"s{i}", "finie")
             etat.terminee = True
-            etat.creee = float(i)  # s0 la plus ancienne
+            etat.creee = maintenant - (4 - i) * 10.0  # s0 la plus ancienne
             agent._TACHES[("projet", f"s{i}")] = etat
         agent._purger()
         # Une seule place à libérer : la plus ancienne part, les 3 autres restent.

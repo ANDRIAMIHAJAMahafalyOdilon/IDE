@@ -29,6 +29,7 @@ import { AgentActivityTimeline } from "./AgentActivityTimeline";
 const ETIQUETTES_ERREUR: Record<string, string> = {
   timeout: "Temps de réponse dépassé",
   quota: "Quota moteur dépassé",
+  palier_gratuit: "Palier gratuit bloqué (CLI)",
   auth: "Authentification du moteur",
   parse_format: "Format de sortie de l'agent non reconnu",
   schema_invalide: "Proposition invalide",
@@ -67,6 +68,45 @@ interface TacheOpenCode {
   id: string;
   consigne: string;
   events: EvenementTache[];
+}
+
+/** Une section d'activité d'affilée, ou une réponse de Roch. */
+type BlocTache =
+  | { type: "activite"; cle: string; events: EvenementTache[] }
+  | { type: "texte"; cle: string; texte: string };
+
+/**
+ * Découpe le flux d'une tâche en blocs ORDONNÉS : une suite d'activités, puis
+ * la réponse de Roch, puis d'autres activités…
+ *
+ * Avant, la timeline recevait tous les événements d'un coup et les réponses
+ * étaient rendues dans un secondlot, après le panneau : tout ce que Roch disait
+ * atterrisson sous son dernier outil, même quand le texte était arrivé avant.
+ * Le rendu suit maintenant l'ordre réel d'arrivée, et chaque réponse est une
+ * vraie bulle de chat posée dans le fil, comme en mode Chat.
+ */
+function blocsTache(events: EvenementTache[]): BlocTache[] {
+  const blocs: BlocTache[] = [];
+  let activite: EvenementTache[] = [];
+  // `blocs.length` est monotone et unique : deux deltas identiques d'affilée
+  // ne peuvent donc pas produire deux fois la même clé React.
+  const viderActivites = () => {
+    if (activite.length) {
+      blocs.push({ type: "activite", cle: "activite:" + blocs.length, events: activite });
+      activite = [];
+    }
+  };
+  for (const evt of events) {
+    if (evt.event === "texte") {
+      if (!evt.data.delta.trim()) continue;
+      viderActivites();
+      blocs.push({ type: "texte", cle: "texte:" + blocs.length, texte: evt.data.delta });
+    } else if (evt.event === "activite" || evt.event === "permission") {
+      activite.push(evt);
+    }
+  }
+  viderActivites();
+  return blocs;
 }
 
 interface ChatPanelProps {
@@ -761,22 +801,31 @@ export function ChatPanel({ projet }: ChatPanelProps) {
         {!enChat && executionEdit === "autonome" &&
           tachesOpenCode.map((tache) => (
             <div className="agent-run" key={tache.id}>
-              <div className="agent-run-user"><span>Utilisateur</span> : {tache.consigne}</div>
-              <AgentActivityTimeline
-                events={tache.events}
-                onOpenFile={(chemin) => void ouvrirFichier(chemin)}
-                onPermission={async (requestId, reply) => {
-                  if (!projet) return;
-                  await repondrePermissionApi(projet, requestId, reply);
-                }}
+              <BulleChat
+                message={{ id: tache.id + ":consigne", role: "user", texte: tache.consigne }}
+                dernier={false}
+                busy={false}
               />
-              {tache.events
-                .filter((evt): evt is Extract<EvenementTache, { event: "texte" }> => evt.event === "texte")
-                .map((evt, i) => (
-                  <div className="agent-run-final" key={i}>
-                    <span>Roch</span> : {evt.data.delta}
-                  </div>
-                ))}
+              {blocsTache(tache.events).map((bloc) =>
+                bloc.type === "texte" ? (
+                  <BulleChat
+                    key={bloc.cle}
+                    message={{ id: bloc.cle, role: "assistant", texte: bloc.texte }}
+                    dernier={false}
+                    busy={false}
+                  />
+                ) : (
+                  <AgentActivityTimeline
+                    key={bloc.cle}
+                    events={bloc.events}
+                    onOpenFile={(chemin) => void ouvrirFichier(chemin)}
+                    onPermission={async (requestId, reply) => {
+                      if (!projet) return;
+                      await repondrePermissionApi(projet, requestId, reply);
+                    }}
+                  />
+                ),
+              )}
             </div>
           ))}
         {busy && !enChat && executionEdit === "autonome" &&

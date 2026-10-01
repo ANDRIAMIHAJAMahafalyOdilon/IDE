@@ -404,9 +404,14 @@ async def _ajouter_evenement_tache(
 ) -> None:
     data = dict(data)
     if nom in ("debut", "fin") and data.get("session"):
-        cle_tache = (etat.projet, etat.session)
-        _SESSIONS_TACHE[cle_tache] = str(data["session"])
-        _SESSIONS_TACHE_TS[cle_tache] = _time.monotonic()
+        # Seul un identifiant OpenCode réel peut être rejoué au tour suivant via
+        # `-s`. Toute autre valeur ferait échouer la session définitivement
+        # (« Session not found »), donc on refuse de la mémoriser.
+        candidat = str(data["session"])
+        if candidat.startswith("ses"):
+            cle_tache = (etat.projet, etat.session)
+            _SESSIONS_TACHE[cle_tache] = candidat
+            _SESSIONS_TACHE_TS[cle_tache] = _time.monotonic()
         # Le frontend garde ce jeton stable ; l'identifiant OpenCode réel reste
         # uniquement dans le backend pour la reprise du prochain tour.
         data["session"] = etat.session
@@ -480,19 +485,33 @@ async def tache_status(projet: str, session: str):
 
 @router.post("/tache/abort")
 async def tache_abort(req: RequeteTacheControle):
-    """Interrompt réellement la session OpenCode du projet."""
-    sid = next(
-        (session for (projet, _), session in _SESSIONS_TACHE.items() if projet == req.projet),
-        None,
-    )
-    if not sid:
-        return {"ok": True, "interrompue": False}
+    """Interrompt réellement la tâche en cours sur ce projet.
+
+    Deux gestes complémentaires. L'abort HTTP visait un serveur OpenCode qui
+    n'existe pas en mode CLI (`opencode run`) : il ne faisait rien, et une tâche
+    coincée sur une commande qui ne rend jamais la main restait `active` pour
+    toujours. Le kill de l'arbre, lui, coupe `opencode` ET ses descendants
+    (`cmd`, `npm`, `node`), qui restaient sinon orphelins.
+    """
+    tue = False
     try:
         racine = workspace.projet_existant(req.projet)
-        opencode.interrompre_session(racine, sid)
-        return {"ok": True, "interrompue": True}
-    except opencode.ErreurOpenCode as exc:
-        raise HTTPException(status_code=400, detail=exc.message) from exc
+    except Exception:  # noqa: BLE001 — projet introuvable : rien à tuer
+        racine = None
+    if racine is not None:
+        tue = agent_tache.interrompre_tache(racine)
+        sid = next(
+            (s for (p, _), s in _SESSIONS_TACHE.items() if p == req.projet),
+            None,
+        )
+        if sid:
+            try:
+                # `agent=True` : la session vient du serveur DÉDIÉ (port 4097),
+                # celui où la demande de permission a été émise.
+                opencode.interrompre_session(racine, sid, agent=True)
+            except opencode.ErreurOpenCode as exc:
+                raise HTTPException(status_code=400, detail=exc.message) from exc
+    return {"ok": True, "interrompue": tue}
 
 
 @router.post("/tache/permission")
@@ -501,7 +520,7 @@ async def tache_permission(req: RequetePermission):
     try:
         racine = workspace.projet_existant(req.projet)
         return opencode.repondre_permission(
-            racine, req.request_id, req.reply, req.message
+            racine, req.request_id, req.reply, req.message, agent=True
         )
     except opencode.ErreurOpenCode as exc:
         raise HTTPException(status_code=400, detail=exc.message) from exc

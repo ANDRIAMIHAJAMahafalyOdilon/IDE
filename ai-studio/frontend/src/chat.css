@@ -892,35 +892,14 @@
   font-family: inherit;
 }
 
-/* Timeline des actions réelles OpenCode. */
+/* Fil d'une tâche Edit : la consigne et les réponses de Roch sont de vraies
+ * bulles de chat, entre les sections d'activité. Le conteneur ne fait qu'aligner
+ * la colonne — les bulles gardent leur propre style d'un bout à l'autre. */
 .agent-run {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 8px;
   margin: 2px 0 8px;
-}
-
-.agent-run-user,
-.agent-run-final {
-  padding: 5px 8px;
-  border-radius: 5px;
-  border: 1px solid var(--line-2);
-  white-space: pre-wrap;
-}
-
-.agent-run-user {
-  background: var(--accent-bg);
-  color: var(--text-1);
-}
-
-.agent-run-user span,
-.agent-run-final span {
-  font-weight: 700;
-}
-
-.agent-run-final {
-  background: var(--bg-2);
-  color: var(--text-1);
 }
 
 .agent-activity {

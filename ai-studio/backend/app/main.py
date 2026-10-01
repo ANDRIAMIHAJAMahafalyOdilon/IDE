@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -70,7 +70,15 @@ if _index.is_file():
 
     @app.get("/{chemin:path}", include_in_schema=False)
     def spa(chemin: str):
-        """Fichier du build s'il existe, sinon index.html (routage côté client)."""
+        """Fichier du build s'il existe, sinon index.html (routage côté client).
+
+        `/api/...` est volontairement exclu : une URL d'API mal orthographiée
+        doit renvoyer un 404 JSON, pas la page d'accueil en HTML. Sans cette
+        garde, le frontend recevait du HTML avec un statut 200 et échouait
+        plus loin sur un `JSON.parse` incompréhensible.
+        """
+        if chemin.startswith("api/"):
+            raise HTTPException(status_code=404, detail="Route API inconnue.")
         if chemin:
             candidat = (FRONTEND_DIST / chemin).resolve()
             # `is_relative_to` neutralise toute évasion hors de dist/ via `../`.

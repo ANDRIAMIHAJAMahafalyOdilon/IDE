@@ -134,7 +134,40 @@ def lister_projets() -> list[dict]:
                 "chemin": str(d),
             })
     projets.extend(registre.projets_directs())
+    _rattraper_comptes_manquants(projets)
     return sorted(projets, key=lambda p: p["nom"].lower())
+
+
+def _rattraper_comptes_manquants(projets: list[dict]) -> None:
+    """Compte les projets « dossier » ouverts avant l'existence de `nb_fichiers`.
+
+    Ces entrées-là n'ont pas la clé : le listing faisait `or 0` et affichait donc
+    « 0 fichiers » pour des dossiers pourtant pleins. On ne scanne QUE ces
+    entrées (une fois), puis on persiste — le temps de calcul est donc payé une
+    seule fois, jamais à chaque listing, comme le veut la règle de performance
+    ci-dessus. Un dossier devenu introuvable reste à 0 sans faire échouer le
+    listing.
+    """
+    a_scanner = [
+        p for p in projets
+        if p.get("origine") == "dossier" and not p.get("nb_fichiers")
+        and p.get("chemin")
+    ]
+    for projet in a_scanner:
+        racine = Path(projet["chemin"])
+        if not racine.is_dir():
+            continue
+        try:
+            compte = sum(1 for _ in _fichiers_lisibles(racine, filtres_pour(racine)))
+        except OSError:
+            continue
+        projet["nb_fichiers"] = compte
+        try:
+            # API publique du registre : idempotente, elle met à jour l'entrée
+            # existante au lieu d'en créer une seconde.
+            registre.ajouter_dossier_direct(str(racine), nb_fichiers=compte)
+        except (OSError, ValueError):
+            pass
 
 
 def _normaliser_archive(binaire: bytes, nom_archive: str | None = None) -> tuple[str, bytes]:

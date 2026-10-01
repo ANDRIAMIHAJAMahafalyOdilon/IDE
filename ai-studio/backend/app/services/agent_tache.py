@@ -31,14 +31,19 @@ import asyncio
 import json
 import logging
 import os
+import queue
+import re
 import shutil
 import subprocess
+import sys
+import threading
 import time
 from pathlib import Path
 from typing import AsyncIterator, Any
 
 from ..config import (
     OPENCODE_BIN,
+    OPENCODE_CONFIG,
     OPENCODE_MODEL,
     TACHE_TIMEOUT,
     OUTIL_APERCU_MAX,
@@ -46,6 +51,21 @@ from ..config import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Les codes couleur ANSI qu'OpenCode écrit sur stderr : sans ce retrait, le
+# diagnostic affiché à l'utilisateur serait illisible.
+_SANS_ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+# Clé d'état du premier texte d'une étape, en attente de verdict.
+#
+# En mode CLI, OpenCode émet l'intention comme un `text` ordinaire : aucune
+# distinction structurelle ne permet de la séparer d'une vraie réponse. Filtrer
+# sur des motifs (« I'll… », « Let me… ») serait fragile et supprimerait des
+# réponses légitimes commençant par « D'abord… ». On diffère donc le texte, et
+# c'est l'événement suivant qui tranche : un outil suit -> c'était une annonce,
+# un texte ou la fin de l'étape -> c'était la réponse.
+CLE_NARRATION = "__narration__"
+CLE_ARME = "__narration_armee__"
 
 def _binaire_npm_global() -> str | None:
     """Cherche le binaire OpenCode dans le dossier global npm (portable, sans chemin en dur).
@@ -162,6 +182,59 @@ def _resume_part(part: dict) -> str:
     return str(resume).replace("\r", "")[:OUTIL_RESUME_MAX].strip()
 
 
+def _classer_erreur_cli(erreur: Any) -> dict[str, Any]:
+    """Traduit l'erreur d'un fournisseur en code et message pour l'UI."""
+    detail = ""
+    statut: Any = None
+    if isinstance(erreur, dict):
+        data = erreur.get("data")
+        if isinstance(data, dict):
+            detail = str(data.get("message") or "")
+            statut = data.get("statusCode")
+        else:
+            detail = str(erreur.get("message") or "")
+    elif erreur is not None:
+        detail = str(erreur)
+
+    texte = detail.lower()
+    try:
+        code_statut = int(statut) if statut is not None else None
+    except (TypeError, ValueError):
+        code_statut = None
+
+    # Testé AVANT le cas 401/403 : la réponse est bien un 403, mais la clé est
+    # acceptée — c'est le palier gratuit qui interdit le mode ligne de commande.
+    # Classé en « auth », l'utilisateur croyait sa clé rejetée et la corrigeait à
+    # tort ; en réalité aucune clé ne Solutionne tant qu'OpenCode n'a pas rouvert
+    # le CLI.
+    if "free tier" in texte or "frettierror" in texte or "within opencode" in texte:
+        return {
+            "code": "palier_gratuit",
+            "message": "OpenCode refuse le mode ligne de commande sur le palier "
+                       "gratuit (erreur « free tier » du fournisseur). La clé est "
+                       "valide : il faut un compte payant, ou attendre la "
+                       "réouverture du CLI.",
+        }
+    if "quota" in texte or "rate limit" in texte or "resource_exhausted" in texte \
+            or code_statut == 429:
+        return {
+            "code": "quota",
+            "message": "Quota du fournisseur dépassé. Réessaie dans un instant.",
+        }
+    if code_statut in (401, 403) or "api key" in texte or "permission" in texte:
+        return {"code": "auth", "message": "Le fournisseur a refusé la clé API."}
+    if code_statut == 404 or "no longer available" in texte:
+        return {
+            "code": "moteur_indisponible",
+            "message": "Le modèle demandé n'est plus disponible. "
+                       "Changez OPENCODE_MODEL dans le .env.",
+        }
+    return {
+        "code": "interne",
+        "message": detail[:300] or "L'agent a signalé une erreur.",
+    }
+
+
 def mapper_ligne(
     ligne: str,
     textes: dict[str, str],
@@ -194,18 +267,45 @@ def mapper_ligne(
     if not isinstance(part, dict):
         part = {}
 
+    if genre == "error":
+        # `opencode run` rapporte l'échec du fournisseur comme un événement
+        # JSON de premier niveau. Sans ce cas, la ligne était ignorée comme
+        # n'importe quel événement inconnu et l'utilisateur ne recevait que
+        # « l'agent s'est arrêté avec le code 1 », sans cause.
+        sorties.append(("erreur", _classer_erreur_cli(evt.get("error"))))
+        return sorties
+
     if genre == "text" and part.get("type") == "text":
         texte = str(part.get("text") or "")
         pid = str(part.get("id") or "main")
         precedent = textes.get(pid, "")
         if len(texte) > len(precedent):
-            textes[pid] = texte
             delta = texte[len(precedent):]
+            textes[pid] = texte
             if delta:
-                sorties.append(("texte", {"delta": delta}))
+                if not etat_activites.get(CLE_ARME):
+                    # L'étape a déjà agi : ce texte est un résultat, il part.
+                    sorties.append(("texte", {"delta": delta}))
+                elif CLE_NARRATION in etat_activites:
+                    # Deuxième texte avant toute action : le premier était la
+                    # réponse, il n'était pas une annonce.
+                    attente = etat_activites.pop(CLE_NARRATION)
+                    sorties.append(("texte", {"delta": str(attente.get("texte") or "")}))
+                    sorties.append(("texte", {"delta": delta}))
+                else:
+                    # Premier texte de l'étape : nature encore inconnue.
+                    etat_activites[CLE_NARRATION] = {"pid": pid, "texte": texte}
         return sorties
 
     if genre == "tool_use" and part.get("type") == "tool":
+        # Un texte d'annonce précède toujours l'action qu'il annonce : c'est du
+        # raisonnement destiné au modèle, pas une réponse pour l'utilisateur.
+        # On l'écarte, et on purge son accumulateur pour qu'un réémargement
+        # ultérieur reparte de zéro. Tout texte suivant est un résultat.
+        narration = etat_activites.pop(CLE_NARRATION, None)
+        if isinstance(narration, dict):
+            textes.pop(str(narration.get("pid") or ""), None)
+        etat_activites[CLE_ARME] = False
         call_id = str(part.get("callID") or part.get("id") or evt.get("id") or "outil")
         outil = str(part.get("tool") or "")
         state = part.get("state") if isinstance(part.get("state"), dict) else {}
@@ -234,20 +334,32 @@ def mapper_ligne(
     if genre in {"step_start", "step.start", "step_finish", "step.finish"}:
         sid = _sid_ligne(evt) or "tache"
         termine = genre in {"step_finish", "step.finish"}
+        # Aucune étape ne peut hériter de l'attente de la précédente.
+        attente = etat_activites.pop(CLE_NARRATION, None)
+        etat_activites[CLE_ARME] = not termine
+        if termine and isinstance(attente, dict) and str(attente.get("texte") or "").strip():
+            # L'étape s'achève sans outil derrière le texte : c'était bien la
+            # réponse, elle part finalement — un peu plus tard, jamais ratée.
+            sorties.append(("texte", {"delta": str(attente.get("texte") or "")}))
         if termine:
             ident = str(etat_activites.pop("__step_courant__", f"step:{sid}"))
-            return [("activite", {
+            sorties.append(("activite", {
                 "id": ident,
                 "type": "thinking",
                 "status": "success",
                 "title": "Étape terminée",
                 "description": str((part.get("reason") or "OpenCode passe à la suite.")).strip(),
-            })]
+            }))
+            return sorties
         compteur = int(etat_activites.get("__nb_etapes__", 0)) + 1
         etat_activites["__nb_etapes__"] = compteur
-        # Un seul élément "analyse" est maintenu dans la timeline : les
-        # étapes successives mettent à jour cette carte au lieu de l'empiler.
-        ident = f"step:{sid}:current"
+        # Un identifiant PAR ÉTAPE. Avec un identifiant unique et réutilisé
+        # (`step:...:current`), le front déduplique par id : toutes les étapes
+        # fusionnaient en une seule carte « Analyse du projet » écrasée en
+        # place, et l'historique réel disparaissait. Le `:current` mémorise
+        # justement quelle étape est ouverte, pour qu'elle se referme sur son
+        # propre `step_finish` au lieu de clore celle d'avant.
+        ident = f"step:{sid}:{compteur}"
         etat_activites["__step_courant__"] = ident
         return [("activite", {
             "id": ident,
@@ -292,6 +404,31 @@ def _demarrer(binaire: str, racine: Path, message: str, sid: str | None) -> subp
     logger.info("tache agent : %s", " ".join(cmd))
     env = os.environ.copy()
     env.setdefault("NO_COLOR", "1")
+    # `opencode run` part avec `--dir` sur le projet de l'utilisateur : sans cette
+    # variable il y découvre SON opencode.jsonc et applique ses permissions, pas
+    # les nôtres. C'est ce mode qui est réellement utilisé par l'API, donc c'est
+    # ici, et non dans le chemin serveur, que la config doit être transmise.
+    env["OPENCODE_CONFIG"] = str(OPENCODE_CONFIG)
+    # Marqueur lu par le plugin `aistudio-arriere-plan.js` : sans lui, une
+    # commande serveur passe au premier plan, y compris dans la session
+    # interactive de l'utilisateur où c'est le comportement voulu.
+    env["AISTUDIO_AGENT"] = "1"
+    # Lus par le plugin pour réécrire la commande ET pour écrire son journal
+    # hors des projets de l'utilisateur (un `.log` dans son dépôt le salirait).
+    try:
+        from .agent_fond import chemin_lanceur, dossier_agents
+
+        env["AISTUDIO_LANCEUR"] = str(chemin_lanceur())
+        env["AISTUDIO_LOG_DIR"] = str(dossier_agents())
+    except Exception:  # noqa: BLE001 — sans lanceur, le plugin ne réécrit rien
+        logger.debug("Lancement arriere-plan indisponible", exc_info=True)
+    # Le fournisseur Google d'OpenCode ne lit que GOOGLE_GENERATIVE_AI_API_KEY,
+    # alors que l'application s'appelle GEMINI_API_KEY. Sans cet alias, OpenCode
+    # démarre sans credential et répond « pas de clé » alors que la clé est
+    # présente dans le .env. Alias dans l'environnement de l'enfant, jamais dans
+    # le .env : on ne duplique pas le secret.
+    if not env.get("GOOGLE_GENERATIVE_AI_API_KEY") and env.get("GEMINI_API_KEY"):
+        env["GOOGLE_GENERATIVE_AI_API_KEY"] = env["GEMINI_API_KEY"]
     return subprocess.Popen(
         cmd,
         cwd=racine,
@@ -397,6 +534,51 @@ def _outil_base(call_id: str, outil: str, saisie: Any, racine: Path) -> dict[str
     return info
 
 
+def _texte_ou_narration(
+    delta: str,
+    cle: str,
+    textes: dict[str, Any],
+    etat_activites: dict[str, Any],
+    sorties: list[tuple[str, dict[str, Any]]],
+) -> list[tuple[str, dict[str, Any]]]:
+    """Écarte le texte d'annonce qui précède une action, comme le mapper CLI.
+
+    Un texte qui précède un outil est du raisonnement destiné au modèle : l'afficher
+    ferait croire à l'utilisateur que l'agent a déjà commencé. Mais le texte ne peut
+    être jugé qu'après coup, d'où l'attente d'un second texte ou d'un outil.
+
+    Clé de dé-doublonnage : la dernière réponse complète déjà diffusée. Sans elle, le
+    mécanisme se retourne contre lui — un modèle qui réécrit sa réponse (au lieu de
+    l'allonger) verrait sa VRAIE réponse être jetée.
+    """
+    if not delta:
+        return sorties
+    # Rien n'a encore été armé dans cette étape : le texte est une réponse.
+    if not etat_activites.get(CLE_ARME):
+        etat_activites.pop(CLE_NARRATION, None)
+        return [*sorties, ("texte", {"delta": delta})]
+    if CLE_NARRATION in etat_activites:
+        # Deuxième texte avant toute action : le premier était la réponse.
+        attente = etat_activites.pop(CLE_NARRATION)
+        return [*sorties,
+                ("texte", {"delta": str(attente.get("delta") or "")}),
+                ("texte", {"delta": delta})]
+    # Premier texte de l'étape : sa nature n'est pas encore connue.
+    etat_activites[CLE_NARRATION] = {"cle": cle, "delta": delta}
+    return sorties
+
+
+def _purger_narration(etat_activites: dict[str, Any], arme: bool) -> None:
+    """Une action commence : le texte en attente était une annonce.
+
+    `arme=False` après un outil : le texte suivant est alors un RÉSULTAT. Sans
+    ce réglage, la vraie réponse d'après un outil resterait en attente et ne
+    partirait jamais — l'utilisateur verrait l'agent se taire après avoir agi.
+    """
+    etat_activites.pop(CLE_NARRATION, None)
+    etat_activites[CLE_ARME] = arme
+
+
 def mapper_evenement_serveur(
     evt: dict[str, Any], racine: Path, outils: dict[str, Any]
 ) -> list[tuple[str, dict[str, Any]]]:
@@ -408,6 +590,9 @@ def mapper_evenement_serveur(
     sid = props.get("sessionID") or evt.get("sessionID")
     roles = outils.setdefault("__roles__", {})
     textes = outils.setdefault("__textes__", {})
+    # L'état du raisonnement est porté par `outils`, le seul objet partagé entre
+    # les appels (le paramètre `activites` du mapper CLI n'existe pas ici).
+    etat_activites = outils.setdefault("__activites__", {})
     sorties: list[tuple[str, dict[str, Any]]] = []
 
     if genre == "message.updated":
@@ -434,6 +619,7 @@ def mapper_evenement_serveur(
         if not delta:
             return sorties
         if champ == "reasoning":
+            etat_activites[CLE_ARME] = True
             return [("activite", {
                 "id": message_id + ":reasoning",
                 "type": "thinking",
@@ -449,7 +635,7 @@ def mapper_evenement_serveur(
         for k in {cle, message_id}:
             if len(textes.get(k, "")) < len(textes.get(cle, "")) + len(delta):
                 textes[k] = textes.get(cle, "") + delta
-        return [("texte", {"delta": delta})]
+        return _texte_ou_narration(delta, cle, textes, etat_activites, sorties)
 
     if genre == "message.part.updated":
         part = props.get("part")
@@ -473,7 +659,9 @@ def mapper_evenement_serveur(
                 if message_id:
                     textes[message_id] = texte
             delta = texte[len(ancien):] if texte.startswith(ancien) else ""
-            return [("texte", {"delta": delta})] if delta else sorties
+            if not delta:
+                return sorties
+            return _texte_ou_narration(delta, cle, textes, etat_activites, sorties)
 
         if part_type in {"reasoning", "thinking"}:
             texte = str(part.get("text") or "")
@@ -481,6 +669,7 @@ def mapper_evenement_serveur(
             ancien = str(textes.get(ident) or "")
             delta = texte[len(ancien):] if texte.startswith(ancien) else texte
             textes[ident] = texte
+            etat_activites[CLE_ARME] = True
             return [("activite", {
                 "id": ident,
                 "type": "thinking",
@@ -490,6 +679,7 @@ def mapper_evenement_serveur(
             })] if delta else sorties
 
         if part_type == "tool":
+            _purger_narration(etat_activites, False)
             call_id = str(part.get("callID") or part.get("id") or evt.get("id") or "outil")
             outil = str(part.get("tool") or "outil")
             state = part.get("state") if isinstance(part.get("state"), dict) else {}
@@ -528,18 +718,35 @@ def mapper_evenement_serveur(
             "description": delta,
         })] if delta else sorties
     if genre in {"session.next.step.started", "step_start"}:
-        ident = f"step:{sid}:current"
+        # Une nouvelle étape arme la détection : ce qui compte comme réponse est
+        # réarmé. Sans cela, le texte d'annonce de l'étape précédente resterait
+        # armé et ferait passer la vraie réponse de la suivante pour une annonce.
+        _purger_narration(etat_activites, True)
+        # Identifiant unique par étape, voir le mapper ligne ~351 : un id
+        # réutilisé fusionnerait toute la timeline en une seule carte.
+        compteur = int(etat_activites.get("__nb_etapes__", 0)) + 1
+        etat_activites["__nb_etapes__"] = compteur
+        ident = f"step:{sid}:{compteur}"
+        etat_activites["__step_courant__"] = ident
         return [("activite", {
             "id": ident, "type": "thinking", "status": "running",
             "title": "Analyse du projet",
         })]
     if genre in {"session.next.step.ended", "step_finish"}:
-        ident = f"step:{sid}:current"
+        # Filet de sécurité, comme côté CLI : une étape qui s'achève sans outil
+        # derrière le texte, c'était bien la réponse. Elle part finalement, un peu
+        # plus tard, plutôt que d'être perdue.
+        attente = etat_activites.pop(CLE_NARRATION, None)
+        etat_activites[CLE_ARME] = False
+        if isinstance(attente, dict) and str(attente.get("delta") or "").strip():
+            sorties.append(("texte", {"delta": str(attente.get("delta"))}))
+        ident = str(etat_activites.pop("__step_courant__", f"step:{sid}:1"))
         return [("activite", {
             "id": ident, "type": "thinking", "status": "success",
             "title": "Analyse terminée",
         })]
     if genre == "session.next.tool.input.started":
+        _purger_narration(etat_activites, False)
         call_id = str(props.get("callID") or evt.get("id") or "outil")
         outil = str(props.get("tool") or "outil")
         info = _outil_base(call_id, outil, props.get("input"), racine)
@@ -656,17 +863,23 @@ def mapper_evenement_serveur(
 
 
 async def executer_tache_serveur(
-    racine: Path, message: str, sid_opencode: str | None = None
+    racine: Path, message: str, sid_opencode: str | None = None,
+    timeout: float = TACHE_TIMEOUT,
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     from . import opencode
 
     try:
-        await asyncio.to_thread(opencode.assurer_serveur, racine)
+        await asyncio.to_thread(opencode.assurer_serveur_agent, racine)
         titre = " ".join(message.split())[:80] or "Tâche OpenCode"
-        sid = sid_opencode or await asyncio.to_thread(opencode.creer_session, racine, titre)
+        # `agent=True` : la session doit vivre sur le serveur DÉDIÉ (port 4097),
+        # celui qui porte `AISTUDIO_AGENT`. Sur le serveur de discussion elle
+        # serait injoignable pour /permission/{id}/reply.
+        sid = sid_opencode or await asyncio.to_thread(
+            opencode.creer_session, racine, titre, True
+        )
         yield ("debut", {"session": sid, "moteur": "opencode", "mode": "server"})
         outils: dict[str, Any] = {}
-        async for evt in opencode.flux_tache(racine, sid, message):
+        async for evt in opencode.flux_tache(racine, sid, message, True, timeout):
             for nom, data in mapper_evenement_serveur(evt, racine, outils):
                 yield (nom, data)
                 if nom == "fin":
@@ -676,6 +889,92 @@ async def executer_tache_serveur(
         raise ErreurTache(exc.code, exc.message) from exc
 
 
+def _terminer_arbre(processus: Any) -> None:
+    """Tue le processus ET toute sa descendance.
+
+    `Popen.kill()` ne vise que le processus lancé — ici `opencode.exe`. Or la
+    commande shell de l'agent (`npm run dev`, un serveur, un watcher) est un
+    petit arbre : `opencode` → `cmd` → `npm` → `node`. Tuer le seul parent
+    laissait les enfants vivants, orphelins, toujours attachés au pipe de
+    sortie. Constaté : 4 arbres `npm run dev` survivant à l'annulation, et la
+    tâche qui restait « active » indéfiniment. `taskkill /T` coupe l'arbre.
+    """
+    if processus is None:
+        return
+    pid = getattr(processus, "pid", None)
+    if sys.platform.startswith("win") and pid:
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(pid), "/T", "/F"],
+                capture_output=True, text=True, timeout=30,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            return
+        except Exception:  # noqa: BLE001 — on retente avec le kill simple
+            pass
+    try:
+        processus.kill()
+    except Exception:  # noqa: BLE001 — processus déjà mort
+        pass
+
+
+# Processus `opencode` en cours, par projet. L'API s'en sert pour annuler une
+# tâche qui pend : un simple abort HTTP ne suffit pas en mode CLI.
+_PROCESSUS: dict[str, Any] = {}
+
+
+def interrompre_tache(racine: str | Path) -> bool:
+    """Annule la tâche en cours sur ce projet. Vrai si un processus a été tué."""
+    processus = _PROCESSUS.get(str(racine))
+    if processus is None:
+        return False
+    _terminer_arbre(processus)
+    return True
+
+
+async def _ligne(processus: Any, budget: float) -> str | None:
+    """Lit une ligne du flux de l'agent, ou None si le budget de temps est épuisé.
+
+    DEUX pièges corrigés ici, tous deux reproduits sur un vrai projet :
+
+    1. `await asyncio.to_thread(readline)` ne rend jamais la main si l'agent est
+       muet. Le délai de fin de tâche n'étant revérifié qu'AVANT l'appel, une
+       commande sans fin (`npm run dev`) neutralisait le timeout : la tâche
+       pendait indéfiniment.
+
+    2. `asyncio.wait_for(to_thread(...))` ne corrige PAS le premier point :
+       annuler l'attente n'arrête pas le thread, et `wait_for` reste bloqué
+       jusqu'à ce que le thread se termine — mesuré : 30 s pour un budget de
+       0,6 s, soit exactement la durée du faux `readline`.
+
+    D'où le montage explicite : un thread deamon lit et dépose dans une file,
+    et la boucle async la sonde en respectant le budget. Le thread peut rester
+    bloqué, il est deamon : il se libère seul quand l'arbre est tué et que le
+    pipe se ferme.
+    """
+    resultat: queue.Queue = queue.Queue(maxsize=1)
+
+    def _lire() -> None:
+        try:
+            resultat.put(processus.stdout.readline())
+        except Exception as exc:  # noqa: BLE001 — remontée à la boucle
+            resultat.put(exc)
+
+    threading.Thread(target=_lire, daemon=True).start()
+    fin = time.monotonic() + max(budget, 0.0)
+    while True:
+        try:
+            valeur = resultat.get_nowait()
+        except queue.Empty:
+            if time.monotonic() >= fin:
+                return None
+            await asyncio.sleep(0.05)
+            continue
+        if isinstance(valeur, Exception):
+            raise valeur
+        return valeur
+
+
 async def executer_tache(
     racine: Path,
     message: str,
@@ -683,15 +982,29 @@ async def executer_tache(
     binaire: str | None = None,
     processus: Any = None,
     timeout: float = TACHE_TIMEOUT,
+    moteur: str = "serveur",
 ) -> AsyncIterator[tuple[str, dict[str, Any]]]:
     """Générateur d'événements du mode autonome (consommé par la route SSE).
 
     *processus* permet l'injection d'un faux processus en test ; s'il est None,
     le processus réel est démarré. Les événements sortent sous forme de tuples
     (nom, data) — la couche API les transforme en événements SSE.
+
+    `moteur="serveur"` (défaut) passe par le serveur OpenCode DÉDIÉ : c'est le
+    seul chemin où une demande de permission peut être présentée à l'utilisateur,
+    `opencode run --auto` approuvant tout silencieusement. `moteur="cli"` garde
+    l'ancien comportement et reste utilisé par les tests.
+
+    Un processus injecté force toujours le mode CLI : les tests de l'ancien
+    chemin ne doivent pas se retrouver à parler à un vrai serveur.
     """
     if not message.strip():
         raise ErreurTache("schema_invalide", "Consigne vide.")
+
+    if moteur == "serveur" and processus is None:
+        async for item in executer_tache_serveur(racine, message, sid_opencode, timeout):
+            yield item
+        return
 
     if processus is None:
         try:
@@ -705,30 +1018,46 @@ async def executer_tache(
 
     textes: dict[str, str] = {}
     activites: dict[str, Any] = {}
+    diagnostic: list[str] = []
     sid_courant: str | None = sid_opencode
     debut_emis = False
     fin_deadline = time.monotonic() + timeout
     evenements_emois = 0
+    # Enregistré pour que l'API puisse tuer l'arbre en cas d'annulation : en
+    # mode CLI, l'appel HTTP d'avortement ne rejoint aucun serveur.
+    _PROCESSUS[str(racine)] = processus
 
     try:
         while True:
             restant = fin_deadline - time.monotonic()
             if restant <= 0:
-                try:
-                    processus.kill()
-                except Exception:  # noqa: BLE001
-                    pass
+                _terminer_arbre(processus)
                 yield ("erreur", {
                     "code": "timeout",
                     "message": f"Tâche annulée au-delà de {int(timeout)} s.",
                 })
                 return
             try:
-                ligne = await asyncio.to_thread(processus.stdout.readline)
+                ligne = await _ligne(processus, restant)
             except Exception as exc:  # noqa: BLE001 — lecture du flux
                 yield ("erreur", {
                     "code": "interne",
                     "message": f"Flux de sortie de l'agent interrompu : {exc}",
+                })
+                return
+            if ligne is None:
+                # Délai dépassé pendant une lecture : l'agent est muet, très
+                # probablement parce qu'il a lancé un `dev` qui ne se termine
+                # jamais. On coupe l'arbre, sinon ses enfants survivent.
+                _terminer_arbre(processus)
+                yield ("erreur", {
+                    "code": "timeout",
+                    "message": (
+                        f"Tâche annulée au-delà de {int(timeout)} s. "
+                        "Une commande lancée par l'agent ne se termine pas "
+                        "(serveur de développement ?) : faites-la tourner en "
+                        "arrière-plan."
+                    ),
                 })
                 return
             if ligne == "":
@@ -738,6 +1067,13 @@ async def executer_tache(
                 evt_brut = json.loads(ligne.strip())
             except json.JSONDecodeError:
                 evt_brut = None
+            if evt_brut is None:
+                # stderr est fusionné dans stdout : sans cela, la vraie cause
+                # d'un arrêt (session inconnue, quota, réseau) disparaît et
+                # l'utilisateur ne voit que « code 1 ».
+                bruit = ligne.strip()
+                if bruit:
+                    diagnostic.append(bruit)
             if isinstance(evt_brut, dict):
                 sid_lu = _sid_ligne(evt_brut)
                 if sid_lu:
@@ -749,31 +1085,48 @@ async def executer_tache(
                     "session": sid_courant, "moteur": "opencode", "mode": "auto",
                 })
 
+            echec_fournisseur = False
             for nom, data in mapper_ligne(
                 ligne, textes, racine=racine, activites=activites
             ):
                 evenements_emois += 1
                 yield (nom, data)
+                if nom == "erreur":
+                    # Le fournisseur a tranché (quota, clé refusée, modèle
+                    # retiré) : continuer à lire ne rapporterait qu'un « code 1 »
+                    # trente secondes plus tard, sans cause.
+                    echec_fournisseur = True
+            if echec_fournisseur:
+                return
 
         if not debut_emis:
             debut_emis = True
+            # `session` vaut None tant qu'aucun identifiant OpenCode n'a été lu.
+            # Un faux identifiant ici serait mémorisé par l'API comme s'il était
+            # réel, puis renvoyé à la requête suivante via `-s` : OpenCode
+            # répond « Session not found » et le tour suivant échoue à son tour,
+            # définitivement. Un échec transitoire casserait la session à vie.
             yield ("debut", {
-                "session": sid_courant or "tache", "moteur": "opencode", "mode": "auto",
+                "session": sid_courant, "moteur": "opencode", "mode": "auto",
             })
         code = getattr(processus, "returncode", None)
         if code is None:
             code = processus.wait(timeout=10)
         if code != 0 and evenements_emois == 0:
+            # Les lignes non-JSON sont du diagnostic OpenCode : elles expliquent
+            # l'échec. On les montre, en ignorant les codes couleur ANSI.
+            cause = " ".join(diagnostic)
+            cause = _SANS_ANSI.sub("", cause).strip()
             yield ("erreur", {
                 "code": "interne",
-                "message": f"L'agent s'est arrêté avec le code {code}.",
+                "message": (
+                    f"L'agent s'est arrêté avec le code {code}."
+                    + (f" {cause[:300]}" if cause else "")
+                ),
             })
             return
-        yield ("fin", {"session": sid_courant or "tache"})
+        yield ("fin", {"session": sid_courant})
     finally:
+        _PROCESSUS.pop(str(racine), None)
         if processus and getattr(processus, "poll", None) is not None:
-            try:
-                if processus.poll() is None:
-                    processus.kill()
-            except Exception:  # noqa: BLE001
-                pass
+            _terminer_arbre(processus)

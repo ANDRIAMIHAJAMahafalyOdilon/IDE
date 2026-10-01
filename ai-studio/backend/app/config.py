@@ -7,27 +7,83 @@ et les variables d'environnement nécessaires aux services.
 from __future__ import annotations
 
 import os
+import shutil
+import sys
 from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Racine du dépôt ai-studio/ (équivaut à parents[2] de app/config.py).
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# --- Deux racines bien distinctes, et la confusion entre les deux casse tout ---
+#
+# SOURCE : racine du dépôt ai-studio/ (équivaut à parents[2] de app/config.py).
+# BUNDLE : ce que l'exécutable embarque. En onefile, PyInstaller extrait dans un
+#          dossier temporaire qui est SUPPRIMÉ à la fermeture : tout ce qu'on y
+#          écrit est perdu, et `__file__` pointe dedans, pas dans le dépôt.
+# DONNÉES : doit survivre aux lancements, donc jamais dans le bundle.
+#
+# Sans cette distinction, un .exe repartait de zéro à chaque démarrage : projets,
+# sessions et index partaient dans le dossier temporaire.
+GEL = bool(getattr(sys, "frozen", False))  # noqa: GEL = gelée en packaging
+if GEL:
+    BUNDLE_DIR = Path(getattr(sys, "_MEIPASS", Path(sys.executable).parent))
+    _donnees_defaut = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "AIStudio" / "data"
+    _config_defaut = Path(os.environ.get("APPDATA") or Path.home()) / "AIStudio"
+else:
+    PROJECT_ROOT = Path(__file__).resolve().parents[2]
+    BUNDLE_DIR = PROJECT_ROOT
+    _donnees_defaut = PROJECT_ROOT / "data"
+    _config_defaut = PROJECT_ROOT
 
-# .env au niveau racine du dépôt, puis fallback backend/.env
-load_dotenv(PROJECT_ROOT / ".env")
-load_dotenv(PROJECT_ROOT / "backend" / ".env", override=False)
+if GEL:
+    # Le .env de l'utilisateur vit hors du bundle : un secret embarqué dans
+    # l'exécutable serait extractible par n'importe qui, et illisible en écriture.
+    load_dotenv(_config_defaut / ".env")
+else:
+    # .env au niveau racine du dépôt, puis fallback backend/.env
+    load_dotenv(BUNDLE_DIR / ".env")
+    load_dotenv(BUNDLE_DIR / "backend" / ".env", override=False)
+
+
+def _preparer_config_opencode() -> Path | None:
+    """Chemin de la config OpenCode À UTILISER, ou None si introuvable.
+
+    En exécutable, la config embarquée est une COPIE figée au moment du build :
+    la modifier dans le dépôt ne changeait rien au .exe, et l'agent continuait de
+    tourner avec l'ancienne valeur. Erreur constatée après avoir passé `bash` de
+    "deny" à "allow" — le bundle contenait toujours "deny", et l'agent répétait
+    « no shell/bash tool available » malgré la correction.
+
+    On dépose donc une copie MODIFIABLE dans %APPDATA%\\AIStudio, créée depuis le
+    bundle au premier lancement. Corriger la config devient une édition de
+    fichier, sans repackaging. Le bundle ne sert plus que de graine.
+    """
+    if not GEL:
+        return BUNDLE_DIR / "opencode.jsonc"
+    bundle = BUNDLE_DIR / "opencode.jsonc"
+    utilisateur = _config_defaut / "opencode.jsonc"
+    if not utilisateur.is_file() and bundle.is_file():
+        try:
+            utilisateur.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(bundle, utilisateur)
+        except OSError:
+            return bundle if bundle.is_file() else None
+    if utilisateur.is_file():
+        return utilisateur
+    return bundle if bundle.is_file() else None
+
+
+_CONFIG_OPENCODE = _preparer_config_opencode()
 
 # Dossier qui contient les projets importés (arborescences téléchargées / créées).
 # Surchargeable (DATA_DIR) pour pointer vers un disque persistant ou un dossier
 # éphémère d'un déploiement cloud ; tous les chemins de données en découlent.
-DATA_DIR = Path(os.getenv("DATA_DIR", str(PROJECT_ROOT / "data")))
+DATA_DIR = Path(os.getenv("DATA_DIR", str(_donnees_defaut)))
 
 # Build du frontend Vite. En développement il n'existe pas (Vite sert la SPA sur
 # 5173 et proxifie /api) ; en production le backend sert directement dist/,
 # ce qui évite un second domaine et tout config CORS.
 FRONTEND_DIST = Path(
-    os.getenv("FRONTEND_DIST", str(PROJECT_ROOT / "frontend" / "dist"))
+    os.getenv("FRONTEND_DIST", str(BUNDLE_DIR / "frontend" / "dist"))
 )
 PROJETS_DIR = Path(os.getenv("PROJETS_DIR", str(DATA_DIR / "projets")))
 # Mémoire durable des fils Chat/Edit. Elle ne dépend plus de la durée de vie
@@ -36,6 +92,15 @@ MEMOIRE_DIR = Path(os.getenv("MEMOIRE_DIR", str(DATA_DIR / "sessions")))
 
 # Serveur OpenCode local (voir opencode_client.py).
 OPENCODE_BASE_URL = os.getenv("OPENCODE_BASE_URL", "http://127.0.0.1:4096").rstrip("/")
+
+# Serveur DEDIE au mode autonome (agent). Port distinct de celui du discussion :
+# c'est la garantie STRUCTURELLE que la session interactive de l'utilisateur ne
+# peut pas hériter de `AISTUDIO_AGENT=1`, qui active la réécriture des commandes
+# longues en arrière-plan. Un port différent rend le partage impossible par
+# construction — pas par une règle vérifiée à l'exécution, qui peut être contournée.
+OPENCODE_AGENT_BASE_URL = os.getenv(
+    "OPENCODE_AGENT_BASE_URL", "http://127.0.0.1:4097"
+).rstrip("/")
 OPENCODE_TIMEOUT = float(os.getenv("OPENCODE_TIMEOUT", "90"))
 
 # Binaire CLI OpenCode pour le MODE AUTONOME (agent qui exécute réellement) :
@@ -53,8 +118,18 @@ OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/big-pickle")
 # tourne avec les valeurs par défaut — tout autorisé, aucune consigne de
 # conduite — et l'agent explore le projet au lieu d'agir.
 OPENCODE_CONFIG = Path(
-    os.getenv("OPENCODE_CONFIG", str(PROJECT_ROOT / "opencode.jsonc"))
+    os.getenv("OPENCODE_CONFIG", str(_CONFIG_OPENCODE or (BUNDLE_DIR / "opencode.jsonc")))
 )
+
+# Garde-fou : `is_file()` et pas `exists()`. Un `datas` mal écrit produit un
+# DOSSIER nommé opencode.jsonc (le fichier est copié À L'INTÉRIEUR), et l'agent
+# échoue alors sur « BadResource: FileSystem.readFile » au premier message.
+if not OPENCODE_CONFIG.is_file():
+    raise FileNotFoundError(
+        f"Config OpenCode introuvable ou illisible : {OPENCODE_CONFIG}. "
+        "En exécutable, le .spec doit embarquer opencode.jsonc à la RACINE du "
+        'bundle (datas = [(source, ".")], pas (source, "opencode.jsonc")).'
+    )
 # Durée maximale d'une tâche agent autonome (secondes).
 TACHE_TIMEOUT = float(os.getenv("TACHE_TIMEOUT", "1200"))
 # Longueur maximale d'un résumé de sortie d'outil (events `outil`).
@@ -91,11 +166,16 @@ RAG_CHEVAUCHEMENT = int(os.getenv("RAG_CHEVAUCHEMENT", "30"))
 RAG_K = int(os.getenv("RAG_K", "3"))
 
 # CORS : en dev, autorise le serveur Vite.
+# inutile en exécutable : la SPA est servie par le backend, donc même origine.
 CORS_ORIGINS = [
     o.strip()
     for o in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",")
     if o.strip()
 ]
+
+# Journaux. Un exécutable compilé `--noconsole` n'affiche rien : sans ce fichier,
+# un plantage au démarrage serait totalement muet.
+LOGS_DIR = Path(os.getenv("LOGS_DIR", str(DATA_DIR / "logs")))
 
 
 def assurer_repertoires() -> None:
@@ -104,3 +184,4 @@ def assurer_repertoires() -> None:
     MEMOIRE_DIR.mkdir(parents=True, exist_ok=True)
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
