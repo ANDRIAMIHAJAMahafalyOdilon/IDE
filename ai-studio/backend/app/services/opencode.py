@@ -174,7 +174,12 @@ def _extraire_texte_final(resultat: dict) -> str:
     return "\n".join(m for m in morceaux if m).strip()
 
 
-def repondre_chat(directory: str | Path, prompt: str, timeout: float | None = None) -> str:
+def repondre_chat(
+    directory: str | Path,
+    prompt: str,
+    timeout: float | None = None,
+    images: list[dict[str, str]] | None = None,
+) -> str:
     """Un tour de discussion libre, sans aucun outil, et retourne le texte final.
 
     L'agent `discussion` (cf. opencode.jsonc) porte le contrat « aucun outil » :
@@ -183,18 +188,24 @@ def repondre_chat(directory: str | Path, prompt: str, timeout: float | None = No
     permission que personne ne peut valider ici, et la réponse resterait bloquée.
     Le prompt de discussion contient DÉJÀ tout le contexte (arborescence, mémoire,
     fichiers) : l'agent n'a rien à lire ni à exécuter.
+
+    `images` ajoute des parties `file` au message. Le texte passe AVANT les
+    images : le modèle a ainsi déjà la question quand il les regarde, et une
+    image seule n'est jamais interprétée comme une consigne.
     """
     racine = str(Path(directory).resolve())
     Path(racine).mkdir(parents=True, exist_ok=True)
     assurer_serveur(racine)
     sid = creer_session(racine, "AI Studio · Chat", agent=False)
     budget = OPENCODE_TIMEOUT if timeout is None else timeout
+    parts: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    parts.extend(images or [])
     try:
         resp = _client(budget).post(
             f"/session/{sid}/message",
             json={
                 "agent": CHAT_AGENT,
-                "parts": [{"type": "text", "text": prompt}],
+                "parts": parts,
             },
             headers={"x-opencode-directory": racine},
         )

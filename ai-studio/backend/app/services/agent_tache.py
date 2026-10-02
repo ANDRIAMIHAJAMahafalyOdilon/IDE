@@ -841,6 +841,12 @@ def mapper_evenement_serveur(
         statut = props.get("status")
         statut = statut.get("type") if isinstance(statut, dict) else statut
         statut = str(statut or "unknown")
+        # L'activité « Analyse OpenCode » porte un id CONSTANT, pour que la
+        # suivante vienne la remplacer sur place plutôt que d'empiler une ligne.
+        # Il faut donc la REFERMER quand le statut quitte « busy » : sans cet
+        # événement de clôture, elle restait affichée « ● En cours… » pour toute
+        # la session, l'interface n'ayant aucun moyen de savoir qu'elle avait
+        # fini. Le frontend remplace un item dès qu'un événement réutilise son id.
         if statut == "busy":
             return [("etat", {"status": statut}), ("activite", {
                 "id": f"session:{sid}:status",
@@ -849,7 +855,13 @@ def mapper_evenement_serveur(
                 "title": "Analyse OpenCode",
                 "description": "OpenCode prépare sa prochaine action…",
             })]
-        return [("etat", {"status": statut})]
+        return [("etat", {"status": statut}), ("activite", {
+            "id": f"session:{sid}:status",
+            "type": "thinking",
+            "status": "success",
+            "title": "Analyse OpenCode",
+            "description": "OpenCode a terminé cette étape.",
+        })]
     if genre == "command.executed":
         commande = props.get("name") or props.get("arguments")
         return [("activite", {

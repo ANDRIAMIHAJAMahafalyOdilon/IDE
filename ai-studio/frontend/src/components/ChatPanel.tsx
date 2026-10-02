@@ -19,6 +19,7 @@ import { useStudio } from "../store/studio";
 import type {
   EvenementTache,
   Modification,
+  PieceJoine,
   Proposition,
   ResultatFichier,
 } from "../types/api";
@@ -38,8 +39,55 @@ const ETIQUETTES_ERREUR: Record<string, string> = {
   serveur_indisponible: "Serveur agent injoignable",
   permission_indisponible: "Permission Roch indisponible",
   opencode: "Erreur Roch",
+  piece_invalide: "Pièce jointe refusée",
   interne: "Erreur interne",
 };
+
+/** Pièce jointe prête à partir : le contenu est déjà en base64. */
+interface PieceUI {
+  cle: string;
+  nom: string;
+  mime: string;
+  ko: number;
+  donnees: string;
+}
+
+/** Mêmes plafonds que `services/pieces_jointe.py` : inutile d'envoyer 12 Mo
+ *  pour recevoir un refus côté serveur, le retour serait plus lent qu'un message. */
+const PIECE_MAX = 6;
+const IMAGE_MAX = 8_000_000;
+const PDF_MAX = 25_000_000;
+const MIMES_PIECE = [
+  "image/png",
+  "image/jpeg",
+  "image/gif",
+  "image/webp",
+  "application/pdf",
+];
+
+function lireEnBase64(fichier: File): Promise<string> {
+  return new Promise((resoudre, rejeter) => {
+    const lecteur = new FileReader();
+    lecteur.onerror = () => rejeter(new Error(`Lecture impossible : ${fichier.name}`));
+    lecteur.onload = () => {
+      const resultat = String(lecteur.result ?? "");
+      const virgule = resultat.indexOf(",");
+      resoudre(virgule >= 0 ? resultat.slice(virgule + 1) : resultat);
+    };
+    lecteur.readAsDataURL(fichier);
+  });
+}
+
+/** Windows et certains sélecteurs envoient un mime vide : l'extension décide. */
+function mimeDevine(nom: string): string {
+  const extension = nom.slice(nom.lastIndexOf(".")).toLowerCase();
+  if (extension === ".png") return "image/png";
+  if (extension === ".jpg" || extension === ".jpeg" || extension === ".jfif") return "image/jpeg";
+  if (extension === ".gif") return "image/gif";
+  if (extension === ".webp") return "image/webp";
+  if (extension === ".pdf") return "application/pdf";
+  return "";
+}
 
 interface BulleChatProps {
   message: MessageDisc;
@@ -155,6 +203,11 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [docsErreur, setDocsErreur] = useState<string | null>(null);
   const [docsBusy, setDocsBusy] = useState(false);
   const fichierInputRef = useRef<HTMLInputElement | null>(null);
+  // Pièces jointes du message en cours (Chat uniquement) : elles partent avec
+  // l'envoi puis sont vidées, faute de quoi la pièce resterait attachée au
+  // message suivant — l'utilisateur enverrait la photo une seconde fois.
+  const [pieces, setPieces] = useState<PieceUI[]>([]);
+  const pieceInputRef = useRef<HTMLInputElement | null>(null);
   // Cartes REPLIÉES, et non dépliées : le vide signifie « tout déplié ». Voir
   // `deployee` plus bas — le diff est visible dès son arrivée, c'est l'information
   // que l'utilisateur attend d'une proposition.
@@ -372,6 +425,48 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     }
   }
 
+  async function choisirPieces(fichiers: FileList | null) {
+    const choisis = Array.from(fichiers ?? []);
+    if (!choisis.length) return;
+    setDocsErreur(null);
+    const refusees: string[] = [];
+    const ajoutees: PieceUI[] = [];
+    for (const fichier of choisis) {
+      const mime = fichier.type || mimeDevine(fichier.name);
+      if (!MIMES_PIECE.includes(mime)) {
+        refusees.push(`${fichier.name} : type non pris en charge`);
+        continue;
+      }
+      const plafond = mime === "application/pdf" ? PDF_MAX : IMAGE_MAX;
+      if (fichier.size > plafond) {
+        refusees.push(`${fichier.name} : trop lourd (${Math.round(fichier.size / 1_000_000)} Mo)`);
+        continue;
+      }
+      try {
+        ajoutees.push({
+          cle: `${fichier.name}-${fichier.size}-${fichier.lastModified}`,
+          nom: fichier.name,
+          mime,
+          ko: Math.max(1, Math.round(fichier.size / 1024)),
+          donnees: await lireEnBase64(fichier),
+        });
+      } catch (e) {
+        refusees.push(e instanceof Error ? e.message : String(e));
+      }
+    }
+    setPieces((precedentes) => {
+      const deja = new Set(precedentes.map((p) => p.cle));
+      const fusion = [...precedentes, ...ajoutees.filter((p) => !deja.has(p.cle))];
+      if (fusion.length > PIECE_MAX) {
+        refusees.push(`maximum ${PIECE_MAX} pièces par message`);
+        return fusion.slice(0, PIECE_MAX);
+      }
+      return fusion;
+    });
+    if (refusees.length) setDocsErreur(refusees.join(" · "));
+    if (pieceInputRef.current) pieceInputRef.current.value = "";
+  }
+
   async function reindexerCours() {
     setDocsBusy(true);
     setDocsErreur(null);
@@ -389,14 +484,18 @@ export function ChatPanel({ projet }: ChatPanelProps) {
 
   // ── Mode CHAT : discussion libre streamée (jamais de diff) ──
   async function envoyerChat() {
-    const consigne = message;
-    if (!consigne.trim() || busy) return;
+    // Une pièce jointe suffit à justifier l'envoi : l'utilisateur colle une
+    // photo et valide sans écrire. Sans consigne ni pièce, il n'y a rien à demander.
+    const consigne = message.trim() || (pieces.length ? "Analyse la pièce jointe." : "");
+    if (!consigne || busy) return;
+    const jointes: PieceJoine[] = pieces.map(({ nom, mime, donnees }) => ({ nom, mime, donnees }));
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     setBusy(true);
     setErreurChat(null);
     setMessage("");
+    setPieces([]);
 
     const disc = useDiscussions.getState();
     let id = activeId;
@@ -415,6 +514,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           session: backendAvant,
           documents: contexteDocs,
           web: contexteWeb,
+          pieces: jointes,
           signal: ctrl.signal,
         },
       )) {
@@ -693,7 +793,8 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const montreBubbles = enChat && active && active.messages.length > 0;
 
   function envoyerActif() {
-    if (busy || !message.trim()) return;
+    if (busy) return;
+    if (!message.trim() && !(enChat && pieces.length)) return;
     if (enChat) void envoyerChat();
     else if (executionEdit === "autonome") void envoyerAutonome();
     else void envoyer();
@@ -965,6 +1066,20 @@ export function ChatPanel({ projet }: ChatPanelProps) {
                     />
                     Recherche web (DuckDuckGo)
                   </label>
+                  <div className="composer-menu-sep">Pièce jointe au message</div>
+                  <div className="composer-menu-actions">
+                    <button
+                      className="composer-mini"
+                      onClick={() => {
+                        setMenuPlus(false);
+                        pieceInputRef.current?.click();
+                      }}
+                      disabled={busy || pieces.length >= PIECE_MAX}
+                      title="Image ou PDF envoyé avec le prochain message (mode Chat)"
+                    >
+                      Image ou PDF…
+                    </button>
+                  </div>
                   <div className="composer-menu-sep">Cours ({docs?.documents.length ?? 0})</div>
                   <div className="composer-menu-actions">
                     <button
@@ -1001,17 +1116,45 @@ export function ChatPanel({ projet }: ChatPanelProps) {
               onKeyDown={(e) => {
                 if (e.key === "Enter" && !busy) envoyerActif();
               }}
-              placeholder="Pose une question…"
+              placeholder={pieces.length ? "Question (facultative si pièce jointe)…" : "Pose une question…"}
               disabled={busy}
             />
             <button
               className="composer-envoi"
               onClick={envoyerActif}
-              disabled={busy || !message.trim()}
+              disabled={busy || (!message.trim() && !pieces.length)}
             >
               {busy ? "…" : "Envoyer"}
             </button>
           </div>
+          {pieces.length > 0 && (
+            <div className="composer-pieces">
+              {pieces.map((piece) => (
+                <span className="composer-piece" key={piece.cle}>
+                  <span className="composer-piece-nom" title={`${piece.nom} · ${piece.ko} Ko`}>
+                    {piece.nom}
+                  </span>
+                  <span className="composer-piece-taille">{piece.ko} Ko</span>
+                  <button
+                    className="composer-piece-retirer"
+                    onClick={() => setPieces((p) => p.filter((x) => x.cle !== piece.cle))}
+                    title="Retirer cette pièce jointe"
+                    disabled={busy}
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <input
+            ref={pieceInputRef}
+            type="file"
+            multiple
+            accept=".png,.jpg,.jpeg,.jfif,.gif,.webp,.pdf,image/png,image/jpeg,image/gif,image/webp,application/pdf"
+            hidden
+            onChange={(e) => void choisirPieces(e.target.files)}
+          />
           <div className="chat-note">
             L'assistant répond sans jamais modifier tes fichiers
             {contexteDocs || contexteWeb ? " — sources (cours + web) citées dans la réponse" : ""}.

@@ -7,6 +7,7 @@ import type {
   ModeAgent,
   Modification,
   NoeudArbre,
+  PieceJoine,
   Projet,
   ResultatEcriture,
   ResultatFichier,
@@ -23,6 +24,8 @@ export interface OptionsChat {
   documents?: boolean;
   /** Recherche web DuckDuckGo pour ancrer la réponse (mode chat). */
   web?: boolean;
+  /** Pièces jointes image/PDF (mode chat uniquement), en base64. */
+  pieces?: PieceJoine[];
   signal?: AbortSignal;
 }
 
@@ -79,6 +82,7 @@ export async function* chatAgent(
   if (opts.simulation?.length) body.simulation = opts.simulation;
   if (opts.documents) body.documents = true;
   if (opts.web) body.web = true;
+  if (opts.pieces?.length) body.pieces = opts.pieces;
 
   const res = await fetch("/api/agent/chat", {
     method: "POST",

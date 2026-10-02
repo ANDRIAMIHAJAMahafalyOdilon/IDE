@@ -944,5 +944,55 @@ def test_tache_muette_ne_laisse_pas_le_processus_dans_le_registre():
     assert str(racine) not in at._PROCESSUS, at._PROCESSUS
 
 
+def test_activite_analyse_est_fermee_quand_le_statut_quitte_busy():
+    """« Analyse OpenCode » doit passer de « En cours » à un état final.
+
+    L'activité porte un id CONSTANT, censé être remplacé sur place. Tant que le
+    statut reste `busy`, c'est normal ; dès qu'il change, un événement de clôture
+    doit être émis, sinon l'interface affiche « ● En cours… » jusqu'à la fin de la
+    session alors que l'agent a terminé depuis longtemps.
+    """
+    racine = Path(tempfile.gettempdir())
+    outils: dict[str, object] = {}
+
+    def statut(valeur: str):
+        return at.mapper_evenement_serveur(
+            {
+                "type": "session.status",
+                "properties": {"sessionID": "sess-analyse", "status": valeur},
+            },
+            racine,
+            outils,
+        )
+
+    busy = statut("busy")
+    assert [genre for genre, _ in busy] == ["etat", "activite"]
+    assert busy[1][1]["status"] == "running"
+
+    fini = statut("idle")
+    activites = [charge for genre, charge in fini if genre == "activite"]
+    assert activites, "le changement de statut doit clôturer l'activité"
+    assert activites[0]["id"] == busy[1][1]["id"], "même id : le frontend remplace"
+    assert activites[0]["status"] == "success", "plus « En cours » pour toute la session"
+
+
+def test_fermeture_ne_depend_pas_du_nom_du_statut():
+    """OpenCode n'annonce pas toujours « idle » : tout ce qui quitte `busy` doit
+    clôturer l'activité, sinon un statut inconnu la laisserait « En cours »."""
+    racine = Path(tempfile.gettempdir())
+    for valeur in ("idle", "done", "completed", "error"):
+        sorties = at.mapper_evenement_serveur(
+            {
+                "type": "session.status",
+                "properties": {"sessionID": "sess-x", "status": valeur},
+            },
+            racine,
+            {},
+        )
+        activites = [charge for genre, charge in sorties if genre == "activite"]
+        assert activites, f"{valeur} doit clôturer l'activité"
+        assert activites[0]["status"] != "running"
+
+
 if __name__ == "__main__":
     sys.exit(_tout_executer())

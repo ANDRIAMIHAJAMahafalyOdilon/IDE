@@ -24,7 +24,7 @@ from sse_starlette.sse import EventSourceResponse
 from ..models.chat import RequeteApply, RequeteChat, RequetePermission, RequeteTache, RequeteTacheControle
 from ..services import (
     agent_adapter, agent_chat, agent_discussion, agent_tache, application, moteurs,
-    opencode, workspace,
+    opencode, pieces_jointe, workspace,
 )
 from ..services.diff import ErreurDiff
 from ..config import MEMOIRE_DIR
@@ -62,6 +62,12 @@ class EtatTache:
     terminee: bool = False
     condition: asyncio.Condition = field(default_factory=asyncio.Condition)
     travail: asyncio.Task[None] | None = None
+    # Dernier état connu de chaque activité, par identifiant. L'interface
+    # déduplique par `id` : une étape la plus récente « remplace » les précédentes.
+    # Sans cet inventaire, une activité dont l'événement de fin n'arrive jamais
+    # (permission refusée, tâche annulée, moteur coupé) resterait affichée
+    # « ● En cours… » pour toujours — c'est ce que l'utilisateur a vu.
+    activites: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Horodatage de création (monotonique) : sert au TTL de la purge.
     creee: float = field(default_factory=_time.monotonic)
 
@@ -226,6 +232,10 @@ async def generer_discussion(req: RequeteChat) -> Any:
     session = _session_id("chat", req.session)
     memoire = _memoire("chat", session)
     try:
+        # Les pièces jointes sont validées AVANT toute construction de prompt :
+        # une image trop lourde ou un PDF illisible doit s'arrêter ici, avec un
+        # message nommé, plutôt qu'au milieu d'un flux déjà commencé.
+        bloc_pieces, images = pieces_jointe.analyser(req.pieces if req.mode == "chat" else [])
         arborescence, bloc = _contexte_discussion(req)
         if req.documents:
             bloc_documents = agent_discussion.construire_bloc_documents(req.message)
@@ -242,8 +252,12 @@ async def generer_discussion(req: RequeteChat) -> Any:
             agent_discussion.construire_memoire(memoire),
             bloc_documents,
             bloc_web,
+            bloc_pieces,
         )
-        source = agent_discussion.stream_reponse(prompt)
+        source = agent_discussion.stream_reponse(prompt, images=images)
+    except pieces_jointe.ErreurPiece as exc:
+        yield _err("piece_invalide", str(exc))
+        return
     except moteurs.ErreurMoteur as exc:
         yield _err(exc.code, exc.message)
         return
@@ -424,9 +438,29 @@ async def _ajouter_evenement_tache(
         # Le frontend garde ce jeton stable ; l'identifiant OpenCode réel reste
         # uniquement dans le backend pour la reprise du prochain tour.
         data["session"] = etat.session
+    if nom == "activite" and data.get("id"):
+        etat.activites[str(data["id"])] = data
     async with etat.condition:
         etat.evenements.append((nom, data))
         etat.condition.notify_all()
+
+
+async def _cloturer_activites(etat: EtatTache, statut: str, raison: str) -> None:
+    """Referme les activités restées ouvertes à la fin de la tâche.
+
+    Une activité n'est close que si son propre événement de fin est arrivé
+    (outil terminé, statut revenu de `busy`). Tous les autres chemins — permission
+    non accordée, annulation, moteur coupé net, erreur interne — la laissaient
+    à « running », donc affichée « En cours » indéfiniment alors que plus rien
+    ne tournait. Ici on referme ce qui reste, avec l'issue réelle de la tâche.
+    """
+    for ident, info in list(etat.activites.items()):
+        if str(info.get("status")) in {"running", "pending"}:
+            await _ajouter_evenement_tache(etat, "activite", {
+                **info,
+                "status": statut,
+                "description": raison,
+            })
 
 
 async def _executer_tache(etat: EtatTache, racine: Path) -> None:
@@ -436,29 +470,38 @@ async def _executer_tache(etat: EtatTache, racine: Path) -> None:
             racine, etat.message, sid_opencode=sid_opencode
         ):
             await _ajouter_evenement_tache(etat, nom, data)
+        # Fin normale : un outil dont l'événement `success`/`failed` n'est jamais
+        # arrivé (coupure du flux) ne doit pas rester « En cours ».
+        await _cloturer_activites(etat, "success", "Tâche terminée.")
         memoire = _memoire("tache", etat.session)
         memoire.append(
             {"question": etat.message, "reponse": "tâche exécutée (mode autonome)"}
         )
         _sauver_memoire("tache", etat.session, memoire)
     except agent_tache.ErreurTache as exc:
+        await _cloturer_activites(etat, "error", "Tâche interrompue.")
         await _ajouter_evenement_tache(etat, "erreur", {
             "code": exc.code,
             "message": exc.message,
             "fichier": None,
         })
     except workspace.CheminHorsProjet as exc:
+        await _cloturer_activites(etat, "error", "Tâche interrompue.")
         await _ajouter_evenement_tache(etat, "erreur", {
             "code": "hors_projet",
             "message": str(exc),
             "fichier": None,
         })
     except Exception as exc:  # noqa: BLE001 — garde-fou du travail détaché
+        await _cloturer_activites(etat, "error", "Tâche interrompue.")
         await _ajouter_evenement_tache(etat, "erreur", {
             "code": "interne",
             "message": f"Erreur interne du backend : {exc}",
             "fichier": None,
         })
+    except asyncio.CancelledError:
+        await _cloturer_activites(etat, "cancelled", "Tâche arrêtée.")
+        raise
     finally:
         async with etat.condition:
             etat.terminee = True

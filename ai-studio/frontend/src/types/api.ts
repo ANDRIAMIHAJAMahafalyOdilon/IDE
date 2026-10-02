@@ -44,6 +44,15 @@ export interface SimulationFichier {
   contenu: string;
 }
 
+/** Pièce jointe du Chat (image ou PDF), envoyée en base64 dans le POST.
+ *  `donnees` ne contient PAS le préfixe `data:` : c'est le backend qui le
+ *  reconstruit, pour décider lui-même du format réellement transmis. */
+export interface PieceJoine {
+  nom: string;
+  mime: string;
+  donnees: string;
+}
+
 export type EvenementSSE =
   | { event: "debut"; data: { session: string | null; autoris: boolean; moteur: string } }
   | { event: "texte"; data: { delta: string } }

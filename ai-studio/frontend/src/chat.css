@@ -838,6 +838,61 @@
   margin-top: 5px;
 }
 
+/* Pièces jointes du message en cours : sous le composeur, comme des
+   étiquettes — l'utilisateur doit voir ce qui partira AVANT d'envoyer. */
+.composer-pieces {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 6px;
+}
+
+.composer-piece {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  padding: 3px 4px 3px 8px;
+  border: 1px solid var(--line-2);
+  border-radius: 3px;
+  background: var(--bg-2);
+  font-size: 11px;
+}
+
+.composer-piece-nom {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 190px;
+}
+
+.composer-piece-taille {
+  color: var(--text-4);
+  flex-shrink: 0;
+}
+
+.composer-piece-retirer {
+  background: transparent;
+  border: none;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.composer-piece-retirer:hover:not(:disabled) {
+  color: var(--danger, #d26);
+  background: var(--bg-3);
+}
+
+.composer-piece-retirer:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
 .chat-note {
   font-size: 10.5px;
   color: var(--text-4);

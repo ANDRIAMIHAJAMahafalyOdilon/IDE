@@ -9,6 +9,7 @@ optionnel et en LECTURE SEULE. D'où l'absence totale de dépendance à
 from __future__ import annotations
 
 import logging
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -95,6 +96,7 @@ def construire_prompt(
     memoire: str,
     bloc_documents: str = "",
     bloc_web: str = "",
+    bloc_pieces: str = "",
 ) -> str:
     """Prompt de discussion : jamais de consigne de format JSON.
 
@@ -102,6 +104,11 @@ def construire_prompt(
     blocs de contexte portent le poids du plafond CONTEXTE_MAX_CAR (≈ 3 800
     tokens, sous les 8 000 TPM de Groq) : on retire d'abord le web, puis les
     documents, la mémoire, et enfin les fichiers ouverts.
+
+    `bloc_pieces` (texte des PDF joints) est HORS troncature, avec la question :
+    c'est le contenu que l'utilisateur a lui-même apporté, pas un contexte
+    consultatif. Le tronquer reviendrait à répondre sur une pièce jointe amputée
+    sans que ni l'utilisateur ni le modèle ne s'en aperçoive.
     """
     budget = max(
         0,
@@ -109,6 +116,7 @@ def construire_prompt(
         - len(SYSTEME)
         - len(instruction)
         - len(arborescence)
+        - len(bloc_pieces)
         - 40,  # en-têtes/labels fixes
     )
     blocs_midiens = [
@@ -133,6 +141,8 @@ def construire_prompt(
             morceaux.append(f"\nConversation récente :\n{texte}\n")
         elif etiquette == "Fichiers" and texte:
             morceaux.append(f"\nFichiers ouverts dans l'éditeur :\n{texte}\n")
+    if bloc_pieces:
+        morceaux.append(f"\n{bloc_pieces}\n")
     morceaux.append(f"\nQuestion de l'utilisateur :\n{instruction}\n")
 
     prompt = "".join(morceaux)
@@ -239,7 +249,7 @@ def _tronconner(texte: str, taille: int = 80) -> Iterator[str]:
         reste = reste[coupe + 1 :]
 
 
-def _flux_opencode(prompt: str) -> Iterator[str]:
+def _flux_opencode(prompt: str, images: list[dict[str, str]] | None = None) -> Iterator[str]:
     """Réponse du moteur OpenCode, découpée pour l'affichage progressif.
 
     `repondre_chat` rend la réponse complète (l'endpoint message ne streame pas).
@@ -247,9 +257,16 @@ def _flux_opencode(prompt: str) -> Iterator[str]:
     la gestion des parties a déjà causé des doublons de texte par le passé.
     `ErreurOpenCode` est traduite en `ErreurMoteur` : sans cela, la bascule vers
     les moteurs suivants de `stream_reponse` ne se ferait pas.
+
+    `images` : parties `file` jointes au message. Seul OpenCode les reçoit — les
+    moteurs de secours sont des API texte et ne sauraient pas quoi en faire.
     """
     try:
-        texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt)
+        if images:
+            texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt, images=images)
+        else:
+            # Sans pièce jointe, l'appel reste exactement celui d'avant.
+            texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt)
     except opencode.ErreurOpenCode as exc:
         raise moteurs.ErreurMoteur("moteur_indisponible", f"opencode : {exc.message}") from exc
     if not texte:
@@ -257,7 +274,7 @@ def _flux_opencode(prompt: str) -> Iterator[str]:
     yield from _tronconner(texte)
 
 
-def _engins() -> list[tuple[str, MoteurFlux]]:
+def _engins(images: list[dict[str, str]] | None = None) -> list[tuple[str, MoteurFlux]]:
     """Chaîne de repli du Chat, résolue à chaque appel.
 
     Volontairement construite à la volée et non figée au chargement du module :
@@ -276,15 +293,23 @@ def _engins() -> list[tuple[str, MoteurFlux]]:
     Gemini et Groq restent en SECOURS — ce qu'ils étaient avant que le moteur
     embarqué existe. Ils ne sont tentés que si OpenCode échoue, ce qui laisse la
     bascule intacte sans jamais en faire le choix par défaut.
+
+Les images jointes sont liées au SEUL moteur OpenCode via `partial` : la
+    signature `MoteurFlux(prompt)` reste donc valide pour les moteurs de secours,
+    qui reçoivent le prompt (texte des PDF compris) et rien de plus. Sans pièce
+    jointe, `_flux_opencode` est passé tel quel — l'appel reste strictement
+    identique à celui d'avant les pièces jointes.
     """
     return [
-        ("opencode", _flux_opencode),
+        ("opencode", _flux_opencode if not images else partial(_flux_opencode, images=images)),
         ("gemini", moteurs.gemini_flux),
         ("groq", moteurs.groq_flux),
     ]
 
 
-def stream_reponse(prompt: str) -> Iterator[tuple[str, Any]]:
+def stream_reponse(
+    prompt: str, images: list[dict[str, str]] | None = None
+) -> Iterator[tuple[str, Any]]:
     """Diffuse la réponse avec basculement automatique, SANS coupure.
 
     Rend des couples ``(type, charge)`` :
@@ -306,7 +331,7 @@ def stream_reponse(prompt: str) -> Iterator[tuple[str, Any]]:
     est l'épuisement de la chaîne, qui lève `ErreurMoteur`.
     """
     erreurs: list[str] = []
-    engins = _engins()
+    engins = _engins(images)
     i = 0
     annonce = False
     while i < len(engins):

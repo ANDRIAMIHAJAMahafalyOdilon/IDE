@@ -80,13 +80,31 @@ class ErreurSSE(BaseModel):
     fichier: str | None = None
 
 
+class PieceJoine(BaseModel):
+    """Pièce jointe envoyée avec un message (mode chat).
+
+    `donnees` est le contenu du fichier en base64, SANS préfixe `data:`. Le
+    frontend n'envoie jamais un chemin : le backend ne lit que ce qu'il reçoit,
+    donc aucun chemin arbitraire du disque utilisateur n'est exposé ici.
+    """
+
+    nom: str
+    mime: str = ""
+    donnees: str
+
+
 class RequeteChat(BaseModel):
     """Corps de POST /api/agent/chat (streaming SSE).
 
     `mode="edit"` (défaut) : l'agent propose des hunks (projet requis).
     `mode="chat"` : discussion libre streamée (projet optionnel, lecture seule,
     aucune modification de fichier — jamais de `proposition`).
+
+    `pieces` n'est honoré qu'en mode `chat` : ce sont les images et PDF choisis
+    avec le bouton « + » du composeur. Le mode edit n'a pas de pièce jointe.
     """
+
+    pieces: list[PieceJoine] = Field(default_factory=list)
 
     mode: Literal["chat", "edit"] = "edit"
     projet: str | None = None

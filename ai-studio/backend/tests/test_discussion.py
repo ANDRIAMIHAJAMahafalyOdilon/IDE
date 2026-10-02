@@ -303,7 +303,7 @@ def test_nuage_en_secours_pas_en_defaut():
     orig_flux = agent_discussion._flux_opencode
     sauv = _patch(lambda c: iter(["nuage"]), lambda c: iter(["groq"]), orig_flux)
     orig = oc.repondre_chat
-    oc.repondre_chat = lambda racine, prompt, timeout=None: "embarque"
+    oc.repondre_chat = lambda racine, prompt, timeout=None, images=None: "embarque"
     try:
         assert _reponse("prompt") == (["opencode"], ["embarque"])
     finally:
@@ -326,7 +326,7 @@ def test_opencode_serie_son_texte_et_bascule_si_vide():
     sauv = _patch(lambda c: iter(["secours"]), lambda c: iter([]), orig_flux)
     orig = oc.repondre_chat
 
-    def vide(racine, prompt, timeout=None):
+    def vide(racine, prompt, timeout=None, images=None):
         return ""
 
     oc.repondre_chat = vide
@@ -347,7 +347,7 @@ def test_erreur_opencode_est_traduite_pour_permettre_la_bascule():
     sauv = _patch(lambda c: iter(["secours"]), lambda c: iter([]), orig_flux)
     orig = oc.repondre_chat
 
-    def casse(racine, prompt, timeout=None):
+    def casse(racine, prompt, timeout=None, images=None):
         raise oc.ErreurOpenCode("serveur_indisponible", "serveur injoignable")
 
     oc.repondre_chat = casse
@@ -377,7 +377,7 @@ def _evenements(events):
 
 def test_generer_discussion_debut_texte_fin_sans_proposition():
     sauv = agent_discussion.stream_reponse
-    agent_discussion.stream_reponse = lambda p: iter(
+    agent_discussion.stream_reponse = lambda p, images=None: iter(
         [("moteur", "gemini"), ("delta", "Bon"), ("delta", "jour")]
     )
     agent._MEMOIRE.pop(("chat", "sess-chat-test"), None)
@@ -404,7 +404,7 @@ def test_generer_discussion_reprise_efface_le_partiel():
     """Bout-en-bout : une coupure en cours de route produit `reprise`, et la
     mémoire du fil ne conserve QUE la réponse du moteur de secours — pas le
     texte tronqué du moteur mort."""
-    def flux(p):
+    def flux(p, images=None):
         yield ("moteur", "gemini")
         yield ("delta", "texte tron")
         yield ("reprise", ("groq", "gemini : délai dépassé."))
@@ -434,7 +434,7 @@ def test_generer_discussion_reprise_efface_le_partiel():
 
 
 def test_generer_discussion_erreur_moteur():
-    def casse(p):
+    def casse(p, images=None):
         raise ErreurMoteur("quota", "gemini : quota dépassé.")
         yield  # pragma: no cover
 
@@ -568,6 +568,43 @@ def test_purge_taches_ne_purge_jamais_une_tache_active():
         assert all(cle in agent._TACHES for cle in actives)
     finally:
         agent.MAX_ENTREES_MEMOIRE = maximum
+        agent._TACHES.clear()
+
+
+def test_activite_restee_en_cours_est_cloturee_en_fin_de_tache():
+    """Une activité « En cours » dont l'événement de fin n'arrive jamais doit être
+    refermée : c'est exactement ce que l'utilisateur a vu affiché toute la session."""
+    etat = agent.EtatTache("projet", "s-cloture", "en cours")
+    analyse = {"id": "session:x:status", "type": "thinking", "status": "running",
+               "title": "Analyse OpenCode"}
+    outil = {"id": "call-1", "type": "terminal", "status": "running", "title": "Commande"}
+    termine = {"id": "call-2", "type": "terminal", "status": "success", "title": "Commande"}
+    try:
+        for info in (analyse, outil, termine):
+            asyncio.run(agent._ajouter_evenement_tache(etat, "activite", info))
+        asyncio.run(agent._cloturer_activites(etat, "error", "Tâche interrompue."))
+        dernier = {}
+        for n, d in etat.evenements:
+            if n == "activite":
+                dernier[d["id"]] = d
+        assert set(dernier) == {analyse["id"], outil["id"], termine["id"]}
+        assert dernier[analyse["id"]]["status"] == "error"
+        assert dernier[outil["id"]]["status"] == "error"
+        assert dernier[analyse["id"]]["title"] == "Analyse OpenCode", "le titre est conservé"
+        assert dernier[termine["id"]]["status"] == "success", "une activité close n'est pas réouverte"
+    finally:
+        agent._TACHES.clear()
+
+
+def test_cloture_ne_touche_pas_les_activites_deja_terminees():
+    etat = agent.EtatTache("projet", "s-cloture2", "en cours")
+    fini = {"id": "call-9", "type": "terminal", "status": "success", "title": "Commande"}
+    try:
+        asyncio.run(agent._ajouter_evenement_tache(etat, "activite", fini))
+        avant = len(etat.evenements)
+        asyncio.run(agent._cloturer_activites(etat, "error", "Tâche interrompue."))
+        assert len(etat.evenements) == avant, "rien à refermer ici"
+    finally:
         agent._TACHES.clear()
 
 
