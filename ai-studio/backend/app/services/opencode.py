@@ -446,27 +446,33 @@ def _demarrer_serveur(
     )
 
 
-def assurer_serveur(directory: str | Path) -> None:
+def assurer_serveur(directory: str | Path) -> bool:
     """Serveur du mode discussion (port 4096), sans aucun flag agent.
 
     Le contrôle de configuration a lieu UNE FOIS par process (`_VETEE`) : le
     serveur étant relancé à ce moment-là, il sert la config courante. Les
     appels suivants — un par question au chat — réutilisent ce serveur sans
     repasser par un `/config`.
+
+    Renvoie True si un serveur a été (re)démarré par cet appel. C'est ce que
+    les appelants utilisent pour purger leurs sessions en cache : un serveur
+    relancé perd toutes les sessions, et un identifiant réutilisé après un
+    redémarrage viserait une session qui n'existe plus.
     """
     global _SERVEUR_PROCESS
     if verifier_serveur():
         if OPENCODE_BASE_URL in _VETEE:
-            return
+            return False
         _VETEE.add(OPENCODE_BASE_URL)
         if not _renouveler_serveur(OPENCODE_BASE_URL):
             # Serveur de l'utilisateur, ou port pris par autre chose : on ne le
             # détruit pas, on tente de s'en servir.
-            return
+            return False
     if _SERVEUR_PROCESS is not None and _SERVEUR_PROCESS.poll() is not None:
         _SERVEUR_PROCESS = None
     _SERVEUR_PROCESS = _demarrer_serveur(directory, OPENCODE_BASE_URL, agent=False)
     _CONFIG_MT_SERVEUR[OPENCODE_BASE_URL] = _mtime_config()
+    return True
 
 
 def assurer_serveur_agent(directory: str | Path) -> None:

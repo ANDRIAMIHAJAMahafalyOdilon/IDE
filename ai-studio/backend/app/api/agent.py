@@ -316,6 +316,15 @@ async def generer_evenements(req: RequeteChat, racine: Path) -> Any:
 
         # ── Moteur réel : session OpenCode réutilisée (proposeur seul) ──
         try:
+            # Le serveur doit être DÉMARRÉ ici, pas seulement réutilisé : sans
+            # ce appel, un Edit lancé avant la première question de Chat
+            # tombait sur le repli cloud — et consommait une clé Gemini alors
+            # que le moteur embarqué était disponible. C'était aussi la
+            # raison du « moteur : llm » annoncé au début du flux.
+            if opencode.assurer_serveur(racine):
+                # Serveur (re)démarré : les sessions précédentes ont disparu
+                # avec lui, leurs identifiants ne désignent plus rien.
+                _SESSIONS_OPENCODE.clear()
             cle_session = (req.projet, session)
             sid = _SESSIONS_OPENCODE.get(cle_session)
             if not sid:

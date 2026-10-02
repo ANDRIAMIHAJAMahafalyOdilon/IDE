@@ -88,8 +88,6 @@ type BlocTache =
 function blocsTache(events: EvenementTache[]): BlocTache[] {
   const blocs: BlocTache[] = [];
   let activite: EvenementTache[] = [];
-  // `blocs.length` est monotone et unique : deux deltas identiques d'affilée
-  // ne peuvent donc pas produire deux fois la même clé React.
   const viderActivites = () => {
     if (activite.length) {
       blocs.push({ type: "activite", cle: "activite:" + blocs.length, events: activite });
@@ -98,9 +96,24 @@ function blocsTache(events: EvenementTache[]): BlocTache[] {
   };
   for (const evt of events) {
     if (evt.event === "texte") {
-      if (!evt.data.delta.trim()) continue;
+      // Les deltas successifs d'une MÊME réponse forment un seul bloc de texte.
+      // Sans cette fusion, chaque delta de 80 caractères devenait une bulle
+      // Chat distincte : une seule réponse s'affichait en une dizaine de
+      // bulles séparées, ce qui est précisément l'affichage « en désordre ».
+      // Seul un événement d'activité entre deux deltas doit couper le bloc :
+      // `activite` est vidée en différé, donc une activité en attente doit
+      // aussi empêcher la fusion, sinon l'ordre texte/activité est perdu.
+      const dernier = blocs[blocs.length - 1];
+      if (dernier?.type === "texte" && activite.length === 0) {
+        dernier.texte += evt.data.delta;
+        continue;
+      }
       viderActivites();
-      blocs.push({ type: "texte", cle: "texte:" + blocs.length, texte: evt.data.delta });
+      blocs.push({
+        type: "texte",
+        cle: "texte:" + blocs.length,
+        texte: evt.data.delta,
+      });
     } else if (evt.event === "activite" || evt.event === "permission") {
       activite.push(evt);
     }
