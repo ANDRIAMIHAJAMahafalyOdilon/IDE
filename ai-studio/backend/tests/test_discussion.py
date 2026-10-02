@@ -68,15 +68,39 @@ def test_contexte_lecture_seule_sans_ecriture():
 
 # ───────────────────────────── Cascade de moteurs ────────────────────────────
 
-def _patch(flux_gemini, flux_groq):
-    sauv = (moteurs.gemini_flux, moteurs.groq_flux)
+def _patch(flux_gemini, flux_groq, flux_opencode=None):
+    """Force les trois moteurs de la chaîne, pour tester la bascule.
+
+    `flux_opencode` neutralise OpenCode, sinon les tests d'épuisement de la
+    chaîne démarreraient un VRAI serveur et passeraient pour une réponse
+    obtenue. Un test qui veut réellement exercer OpenCode lui passe le flux
+    d'origine.
+
+    L'ordre ne dépend plus des clés : OpenCode est toujours en tête. Les flux
+    cloud sont donc passés en PREMIER argument, pour que `flux_opencode` reste
+    le seul paramètre optionnel.
+    """
+    def _casse(c):
+        raise ErreurMoteur("moteur_indisponible", "opencode : hors sujet ici.")
+        yield  # pragma: no cover — fait de la fonction un générateur
+
+    sauv = (
+        agent_discussion._flux_opencode,
+        moteurs.gemini_flux,
+        moteurs.groq_flux,
+    )
+    agent_discussion._flux_opencode = flux_opencode or _casse
     moteurs.gemini_flux = flux_gemini
     moteurs.groq_flux = flux_groq
     return sauv
 
 
 def _restaure(sauv):
-    moteurs.gemini_flux, moteurs.groq_flux = sauv
+    (
+        agent_discussion._flux_opencode,
+        moteurs.gemini_flux,
+        moteurs.groq_flux,
+    ) = sauv
 
 
 def _reponse(prompt):
@@ -88,7 +112,9 @@ def _reponse(prompt):
     )
 
 
-def test_gemini_prioritaire_et_agregation():
+def test_nuage_agrege_les_deltas():
+    """Gemini/Groq sont des SECOURS : une fois OpenCode neutralisé, ils
+    répondent normalement et leurs deltas sont agrégés tels quels."""
     sauv = _patch(lambda c: iter(["Bon", "jour"]), lambda c: iter(["jamais"]))
     try:
         assert _reponse("prompt") == (["gemini"], ["Bon", "jour"])
@@ -195,8 +221,13 @@ def test_plus_de_reprise_emise_quand_le_secours_echoue():
 
 
 def test_bascule_en_chaine_puis_echec_final():
-    """Gemini stream puis coupe, Groq stream puis coupe : une SEULE reprise,
-    puis l'échec remonte une fois le texte réellement reçu."""
+    """Toute la chaîne tombe : une reprise par bascule, puis l'échec remonte.
+
+    OpenCode échoue tout en premier et SANS streamer : il ne produit ni delta ni
+    `reprise` — le client n'a rien à effacer. La seule bascule visible est donc
+    celle de Gemini vers Groq, et Groq tombant en dernier il n'y a plus de moteur
+    derrière elle pour justifier une seconde reprise.
+    """
     def coupe(nom, texte):
         def _f(c):
             yield texte
@@ -217,13 +248,16 @@ def test_bascule_en_chaine_puis_echec_final():
             raise AssertionError("ErreurMoteur attendue en fin de chaîne")
     finally:
         _restaure(sauv)
-    # Un seul `reprise` : le client n'a rien à effacer une seconde fois.
     assert genres == ["moteur", "delta", "reprise", "delta"], genres
 
 
 def test_moteur_vide_puis_secours_coupe_sans_reprise():
-    """Gemini ne renvoie rien : aucun delta n'ayant été affiché, le passage à
-    Groq ne demande AUCUNE reprise (le client n'a rien à effacer)."""
+    """Gemini ne renvoie rien, Groq stream puis coupe : AUCUNE reprise.
+
+    Rien n'ayant été affiché avant la coupure de Groq, le client n'a rien à
+    effacer ; et comme OpenCode a déjà échoué en tête de chaîne, il ne reste
+    personne pour lui succéder.
+    """
     def vide(c):
         return iter([])
         yield  # pragma: no cover
@@ -246,6 +280,89 @@ def test_moteur_vide_puis_secours_coupe_sans_reprise():
     finally:
         _restaure(sauv)
     assert genres == ["moteur", "delta"], genres
+
+
+# ─────────────────── Moteur OpenCode du Chat (toujours en tête) ───────────────
+
+def test_opencode_est_en_tete_de_la_chaine():
+    """Le moteur embarqué répond, la clé Gemini ne doit pas détourner la
+    conversation vers un service distant : sa place ne dépend d'aucune clé."""
+    sauv = _patch(lambda c: iter([]), lambda c: iter([]))
+    try:
+        noms = [n for n, _ in agent_discussion._engins()]
+    finally:
+        _restaure(sauv)
+    assert noms == ["opencode", "gemini", "groq"]
+
+
+def test_nuage_en_secours_pas_en_defaut():
+    """Gemini et Groq restent atteignables si OpenCode échoue, mais ne sont
+    jamais essayés avant lui."""
+    import app.services.opencode as oc
+
+    orig_flux = agent_discussion._flux_opencode
+    sauv = _patch(lambda c: iter(["nuage"]), lambda c: iter(["groq"]), orig_flux)
+    orig = oc.repondre_chat
+    oc.repondre_chat = lambda racine, prompt, timeout=None: "embarque"
+    try:
+        assert _reponse("prompt") == (["opencode"], ["embarque"])
+    finally:
+        oc.repondre_chat = orig
+        _restaure(sauv)
+
+
+def test_tronconner_ne_perd_aucun_caractere():
+    texte = "x" * 205
+    morceaux = list(agent_discussion._tronconner(texte))
+    assert "".join(morceaux) == texte
+    assert len(morceaux) == 3
+
+
+def test_opencode_serie_son_texte_et_bascule_si_vide():
+    """Réponse vide : on ne bave pas « opencode » dans l'interface."""
+    import app.services.opencode as oc
+
+    orig_flux = agent_discussion._flux_opencode
+    sauv = _patch(lambda c: iter(["secours"]), lambda c: iter([]), orig_flux)
+    orig = oc.repondre_chat
+
+    def vide(racine, prompt, timeout=None):
+        return ""
+
+    oc.repondre_chat = vide
+    try:
+        # Seul le moteur qui produit un token est annoncé : opencode échoue
+        # avant le premier, donc l'interface ne doit pas afficher son nom.
+        assert _reponse("prompt") == (["gemini"], ["secours"])
+    finally:
+        oc.repondre_chat = orig
+        _restaure(sauv)
+
+
+def test_erreur_opencode_est_traduite_pour_permettre_la_bascule():
+    """Sans traduction en ErreurMoteur, la chaîne cloud ne serait jamais tentée."""
+    import app.services.opencode as oc
+
+    orig_flux = agent_discussion._flux_opencode
+    sauv = _patch(lambda c: iter(["secours"]), lambda c: iter([]), orig_flux)
+    orig = oc.repondre_chat
+
+    def casse(racine, prompt, timeout=None):
+        raise oc.ErreurOpenCode("serveur_indisponible", "serveur injoignable")
+
+    oc.repondre_chat = casse
+    try:
+        assert _reponse("prompt") == (["gemini"], ["secours"])
+    finally:
+        oc.repondre_chat = orig
+        _restaure(sauv)
+
+
+def test_prompt_discussion_ne_mentionne_aucun_outil():
+    """Le Chat reste un chat : le prompt ne doit rien suggérer d'exécutable."""
+    prompt = construire_prompt("Explique.", "a.py", "", "")
+    assert "bash" not in prompt.lower()
+    assert "exécute" not in prompt.lower()
 
 
 # ───────────────────── Événementiel /chat (mode chat) ────────────────────────

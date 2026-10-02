@@ -12,31 +12,79 @@
     "Tu travailles dans un IDE ouvert par un utilisateur sur sa propre machine.\n\nL'utilisateur attend qu'une action soit faite, pas un compte rendu de réflexion.\n\n- Si la demande nomme un fichier, lis CE fichier, fais la transformation, arrête-toi.\n- Si la demande est vague (« renomme foo », « corrige ça », « lance mon projet »), cherche d'abord le fichier ou la commande concernée : lire est toujours permis et nécessaire. Ne réponds jamais « donne-moi le chemin » sans avoir cherché.\n- Ne réponds JAMAIS par un nombre, un nom ou un constat que tu n'as pas vérifié en lisant ou en exécutant. Une information non vérifiée est une information inventée.\n- Ne parcours pas tout le projet pour faire un inventaire, sauf si on te demande explicitement de le cartographier.\n- Tu peux exécuter les commandes npm autorisées (voir la permission bash). Sers-t'en : « lance mon projet » veut dire LANCER LES SERVEURS, pas expliquer comment faire.\n- Un serveur de développement ne se termine jamais : lance-le EN ARRIÈRE-PLAN et ne l'attends pas. Rappelle en une ligne ce que tu as lancé et sur quelle URL.\n- Si une commande est refusée par la permission, dis-le en une phrase et propose la commande exacte que l'utilisateur peut lancer lui-même. Ne prétends jamais l'avoir exécutée.\n- Va droit au but. Une phrase sur ce que tu as fait suffit ; n'énumère pas les étapes.\n- Ne réécris pas un fichier si la demande ne le demande pas."
   ],
 
-  // "ask" est la valeur qui fait fonctionner le mode autonome, et elle n'est pas
-  // un compromis.
+  // `bash: "allow"` — décision de l'utilisateur, à ne pas ré-inverser en
+  // "ask" : la demande de permission NE POUVAIT PAS être honorée en mode Edit.
+  // L'agent Edit tourne sur le serveur de discussion (4096) et le frontend de
+  // l'Edit (`generer_evenements`) ne relaie aucun événement `permission.asked` :
+  // une commande tentée se traduisait par une requête figée jusqu'au timeout,
+  // sans que rien ne s'affiche à l'utilisateur.
   //
-  // Le chemin de production est le serveur DÉDIÉ (port 4097, cf.
-  // services/agent_tache.py:executer_tache_serveur), qui lance une session et
-  // diffuse ses événements — SANS `--auto`. C'est cette absence de `--auto` qui
-  // rend la demande de permission possible : OpenCode l'émet (`permission.asked`),
-  // le backend la relaie en SSE, et /tache/permission la transmet au serveur
-  // dédié. Sans cela, le bouton de l'interface n'aurait rien à faire et
-  // l'agent déciderait seul.
-  //
-  // `deny` ne conviendrait pas : l'agent perdrait le shell et déclarerait « no
-  // shell/bash tool available », y compris pour le banal « npm run dev ».
+  // Conséquence assumée : aucune confirmation n'est demandée. Le mode autonome
+  // peut donc exécuter n'importe quelle commande, et l'agent Edit n'est plus
+  // contraint de s'en tenir à son contrat de « proposeur seul » (cf.
+  // SYSTEME_PROMPT dans services/opencode.py). Pour revenir à une confirmation,
+  // il faut AUSSI traiter `permission.asked` côté Edit — sans quoi `ask`
+  // reproduit exactement le blocage ci-dessus.
   //
   // Deux pièges vérifiés sur le binaire installé, à ne pas re-découvrir :
   //   * la forme OBJET (`{ "npm run *": "allow", "*": "deny" }`), pourtant
   //     décrite par le schéma opencode.ai/config.json, est IGNORÉE — l'outil
   //     disparaît. Seules les formes chaîne ("allow" / "deny" / "ask") sont
   //     appliquées ;
-  //   * le serveur de discussion (4096) reçoit la MÊME config. `ask` n'y est pas
-  //     dérangeant : l'agent n'y demandera que s'il tente une commande, et la
-  //     réponse n'est possible que par le chemin agent, ce qu'il ignore. Il y
-  //     faut donc à l'utilisateur une session à lui, où il répond dans son TTY.
+  //   * `task: "deny"` neutralise le sous-agent : il n'a aucun intérêt ici et
+  //     ajouterait une demande de permission dans une session sans issue.
   "permission": {
-    "bash": "ask",
+    "bash": "allow",
     "task": "deny"
+  },
+
+// L'agent du mode Edit : un PROPOSEUR. Il n'a aucun outil, donc aucune
+  // permission à demander — plus rien à attendre devant un dialogue — et il ne
+  // peut pas partir explorer le projet ou lancer une commande, ce qui le rendait
+  // lent et imprévisible. Sa seule sortie est la proposition de modification que
+  // `generer_propositions_moteur` transforme en hunks, donc le code modifié
+  // s'affiche, et l'utilisateur valide avant toute écriture.
+//
+//  L'agent `discussion` du Chat est défini plus bas et sert la même garantie.
+"agent": {
+    "proposition": {
+      "description": "Proposeur d'édition : aucun outil, ne propose que des hunks",
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "task": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "todowrite": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "lsp": "deny",
+        "skill": "deny"
+      }
+    },
+
+    "discussion": {
+      "description": "Discussion libre, sans accès aux fichiers ni au shell",
+      "permission": {
+        "bash": "deny",
+        "edit": "deny",
+        "read": "deny",
+        "glob": "deny",
+        "grep": "deny",
+        "list": "deny",
+        "task": "deny",
+        "webfetch": "deny",
+        "websearch": "deny",
+        "todowrite": "deny",
+        "question": "deny",
+        "external_directory": "deny",
+        "lsp": "deny",
+        "skill": "deny"
+      }
+    }
   }
 }

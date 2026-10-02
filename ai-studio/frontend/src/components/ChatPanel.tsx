@@ -142,7 +142,10 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [docsErreur, setDocsErreur] = useState<string | null>(null);
   const [docsBusy, setDocsBusy] = useState(false);
   const fichierInputRef = useRef<HTMLInputElement | null>(null);
-  const [cartesDepliees, setCartesDepliees] = useState<Set<string>>(new Set());
+  // Cartes REPLIÉES, et non dépliées : le vide signifie « tout déplié ». Voir
+  // `deployee` plus bas — le diff est visible dès son arrivée, c'est l'information
+  // que l'utilisateur attend d'une proposition.
+  const [cartesRepliees, setCartesRepliees] = useState<Set<string>>(new Set());
   const abortRef = useRef<AbortController | null>(null);
   const fluxRef = useRef<HTMLDivElement | null>(null);
 
@@ -638,7 +641,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   }
 
   function basculerCarte(cle: string) {
-    setCartesDepliees((c) => {
+    setCartesRepliees((c) => {
       const suiv = new Set(c);
       suiv.has(cle) ? suiv.delete(cle) : suiv.add(cle);
       return suiv;
@@ -847,7 +850,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           props.map((p) => {
             const cle = p.fichier + ":" + p.source_hash;
             const s = acceptes.get(p.fichier) ?? new Set<number>();
-            const deployee = cartesDepliees.has(cle);
+            const deployee = !cartesRepliees.has(cle);
             return (
               <div className="prop-carte" key={cle}>
                 <div className="prop-entete">

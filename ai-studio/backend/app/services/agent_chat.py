@@ -21,6 +21,11 @@ from . import workspace
 from . import agent_adapter
 from ..config import (
     ARBRE_CONTEXTE_MAX,
+    CONTEXTE_EDIT_MAX_CAR,
+    FICHIER_CONTEXTE_MAX_CAR,
+    FICHIER_CONTEXTE_MAX_LIGNES,
+    FICHIER_EDIT_MAX_CAR,
+    FICHIER_EDIT_MAX_LIGNES,
     FICHIERS_CONTEXTE_MAX,
     MEMOIRE_ECHANGES_MAX,
 )
@@ -86,14 +91,27 @@ def _construire_memoire(memoire: list[dict[str, Any]]) -> str:
 def _construire_contexte(
     racine: Path,
     fichiers_contexte: list[str] | None,
+    mode_edit: bool = False,
 ) -> tuple[str, str]:
-    """(arborescence compacte, bloc des fichiers de contexte limité)."""
+    """(arborescence compacte, bloc des fichiers de contexte limité).
+
+    `mode_edit` bascule sur des plafonds bien plus larges : voir
+    `appliquer_patch`, dont les numéros de ligne n'existent que si la zone à
+    modifier est réellement présente dans le contexte.
+    """
     arborescence = workspace.arborescence_texte(racine, limite=ARBRE_CONTEXTE_MAX)
     bloc_fichiers = ""
     if fichiers_contexte:
         chemins = [c for c in fichiers_contexte if c][: FICHIERS_CONTEXTE_MAX]
         if chemins:
-            bloc_fichiers = workspace.bloc_fichiers_contexte(chemins, racine)
+            bloc_fichiers = workspace.bloc_fichiers_contexte(
+                chemins,
+                racine,
+                limite_car=FICHIER_EDIT_MAX_CAR if mode_edit else FICHIER_CONTEXTE_MAX_CAR,
+                limite_lignes=(
+                    FICHIER_EDIT_MAX_LIGNES if mode_edit else FICHIER_CONTEXTE_MAX_LIGNES
+                ),
+            )
     return arborescence, bloc_fichiers
 
 
@@ -109,9 +127,15 @@ def generer_propositions_moteur(
     Retourne {moteur, texte_resume, propositions}. Lève ErreurAdaptateur
     (parse/validation/moteur) — l'API le convertit en événement `erreur`.
     """
-    arborescence, bloc_fichiers = _construire_contexte(racine, fichiers_contexte)
+    arborescence, bloc_fichiers = _construire_contexte(
+        racine, fichiers_contexte, mode_edit=True
+    )
     prompt = agent_adapter.construire_prompt(
-        instruction, arborescence, bloc_fichiers, _construire_memoire(memoire)
+        instruction,
+        arborescence,
+        bloc_fichiers,
+        _construire_memoire(memoire),
+        budget_car=CONTEXTE_EDIT_MAX_CAR,
     )
     moteur, brut = agent_adapter.proposer_modifications(prompt, sid_opencode, racine)
 
@@ -122,9 +146,21 @@ def generer_propositions_moteur(
         if prop["action"] == "delete":
             propositions.append(_proposition_suppression(racine, fichier))
             continue
-        nouveau = str(prop["contenu"])
         chemin = workspace.chemin_securise(racine, fichier)
         ancien = workspace.lire_fichier_ou(chemin, "")
+        if prop["action"] == "patch":
+            # Le patch ne porte que les lignes modifiées : c'est le contenu RÉEL
+            # du disque qui sert de base, pas celui renvoyé par l'agent. Sans
+            # cela, un fichier tronqué en contexte produirait une proposition qui
+            # effacerait tout ce que le modèle n'a pas vu.
+            try:
+                nouveau = workspace.appliquer_patch(ancien, prop["operations"])
+            except workspace.PatchInvalide as exc:
+                raise agent_adapter.ErreurAdaptateur(
+                    "patch_invalide", str(exc), fichier=fichier,
+                ) from exc
+        else:
+            nouveau = str(prop["contenu"])
         if ancien == nouveau:
             continue
         diff = build_diff(ancien, nouveau)

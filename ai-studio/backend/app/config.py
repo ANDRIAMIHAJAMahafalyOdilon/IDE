@@ -44,6 +44,25 @@ else:
     load_dotenv(BUNDLE_DIR / "backend" / ".env", override=False)
 
 
+_AGENTS_REQUIS = ("discussion", "proposition")
+
+
+def _config_a_les_agents(chemin: Path, agents: tuple[str, ...]) -> bool:
+    """Vrai si `chemin` déclare chacun des `agents` demandés.
+
+    Détection par recherche du nom quoted plutôt que par parsing JSON : le
+    fichier est du JSONC (commentaires autorisés), et OpenCode n'expose pas de
+    parseur côté Python ici. Les noms cherchés sont des identifiants que nous
+    écrivons nous-mêmes, donc la recherche de `"nom"` est suffisante — et une
+    config illisible vaut « pas à jour », ce qui déclenche le rafraîchissement.
+    """
+    try:
+        texte = chemin.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return all(f'"{nom}"' in texte for nom in agents)
+
+
 def _preparer_config_opencode() -> Path | None:
     """Chemin de la config OpenCode À UTILISER, ou None si introuvable.
 
@@ -61,12 +80,27 @@ def _preparer_config_opencode() -> Path | None:
         return BUNDLE_DIR / "opencode.jsonc"
     bundle = BUNDLE_DIR / "opencode.jsonc"
     utilisateur = _config_defaut / "opencode.jsonc"
-    if not utilisateur.is_file() and bundle.is_file():
+    if bundle.is_file():
         try:
-            utilisateur.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(bundle, utilisateur)
+            if not utilisateur.is_file():
+                utilisateur.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(bundle, utilisateur)
+            elif not _config_a_les_agents(utilisateur, _AGENTS_REQUIS):
+                # Mise à jour : la config semée lors d'un lancement précédent
+                # n'a pas les agents ajoutés depuis. Sans cette rafraîchissement,
+                # l'application démarrerait avec une config périmée et
+                # l'Edit retombait en silence sur l'agent par défaut — qui, lui,
+                # a le droit d'écrire et d'exécuter des commandes. Le serveur
+                # OpenCode lisant sa config au DÉMARRAGE, il faut aussi le
+                # redémarrer, ce que fait `opencode.assurer_serveur`.
+                # L'ancien fichier est conservé : la config reste éditable à la
+                # main, on ne veut pas perdre une correction de l'utilisateur.
+                shutil.copy2(utilisateur, utilisateur.with_suffix(".jsonc.bak"))
+                shutil.copy2(bundle, utilisateur)
         except OSError:
-            return bundle if bundle.is_file() else None
+            if utilisateur.is_file():
+                return utilisateur
+            return bundle
     if utilisateur.is_file():
         return utilisateur
     return bundle if bundle.is_file() else None
@@ -110,6 +144,13 @@ OPENCODE_BIN = os.getenv("OPENCODE_BIN", "")
 # les projets ouverts sous data/projets/ ou en mode DIRECT ne possèdent pas
 # forcément leur propre opencode.jsonc.
 OPENCODE_MODEL = os.getenv("OPENCODE_MODEL", "opencode/big-pickle")
+# Dossier neutre du serveur OpenCode pour le mode Chat. Le Chat ne travaille pas
+# dans un projet : son contexte est déjà assemblé dans le prompt (arborescence,
+# mémoire, fichiers), donc aucun outil ne lui est utile. Ce dossier ne sert qu'à
+# satisfaire l'exigence de `directory` du serveur. Il ne doit PAS être le projet
+# de l'utilisateur : un dossier neutre rend impossible toute lecture ou écriture
+# fortuite dans ses fichiers.
+OPENCODE_CHAT_DIR = Path(os.getenv("OPENCODE_CHAT_DIR", str(DATA_DIR / "chat")))
 # Config OpenCode de l'application (opencode.jsonc à la racine de ai-studio/).
 # Elle porte les instructions de conduite de l'agent et ses permissions.
 # Elle DOIT être passée au serveur via la variable OPENCODE_CONFIG : le serveur
@@ -152,9 +193,29 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 # ~14 000 car. ≈ 3 800 tokens → un prompt + sa réponse tiennent dans la minute.
 ARBRE_CONTEXTE_MAX = int(os.getenv("ARBRE_CONTEXTE_MAX", "40"))
 ARBORESCENCE_CACHE_SECONDES = float(os.getenv("ARBORESCENCE_CACHE_SECONDES", "5"))
-FICHIER_CONTEXTE_MAX_CAR = int(os.getenv("FICHIER_CONTEXTE_MAX_CAR", "2500"))
+# Par fichier de contexte. 2 500 car. ne laissaient que ~10 % d'un fichier de
+# 26 ko : l'agent ne pouvait ni voir la région à modifier, ni la restituer. Avec
+# le patch par numéros de ligne, il suffit de voir la bonne fenêtre, mais cette
+# fenêtre doit exister — d'où 9 000 car., soit ~2 400 lignes.
+FICHIER_CONTEXTE_MAX_CAR = int(os.getenv("FICHIER_CONTEXTE_MAX_CAR", "9000"))
+# Le préfixe «   12 | » coûte 8 caractères par ligne : sans plafond de lignes,
+# un fichier uniquement fait de retours à la ligne transformerait 9 000 car. en
+# ~80 000. 1 200 lignes suffisent largement à situer une modification.
+FICHIER_CONTEXTE_MAX_LIGNES = int(os.getenv("FICHIER_CONTEXTE_MAX_LIGNES", "1200"))
 FICHIERS_CONTEXTE_MAX = int(os.getenv("FICHIERS_CONTEXTE_MAX", "3"))
 CONTEXTE_MAX_CAR = int(os.getenv("CONTEXTE_MAX_CAR", "14000"))
+
+# Budget du mode EDIT, volontairement plus large que celui du Chat.
+# Le patch se fait par numéros de ligne : si la ligne à modifier n'est pas dans
+# le contexte, l'agent ne peut pas la situer et répond `[]` — c'est exactement
+# ce qui se passait sur un fichier de 26 ko, dont la ligne 247 tombait au-delà
+# du plafond. 40 000 car. couvre la quasi-totalité des fichiers source usuels en
+# un seul envoi (donc sans second aller-retour, donc sans latence ajoutée).
+# Le Chat garde CONTEXTE_MAX_CAR : il n'a pas besoin du fichier entier et reste
+# sous le quota de 8 000 TPM de Groq.
+CONTEXTE_EDIT_MAX_CAR = int(os.getenv("CONTEXTE_EDIT_MAX_CAR", "40000"))
+FICHIER_EDIT_MAX_CAR = int(os.getenv("FICHIER_EDIT_MAX_CAR", "40000"))
+FICHIER_EDIT_MAX_LIGNES = int(os.getenv("FICHIER_EDIT_MAX_LIGNES", "3000"))
 MEMOIRE_ECHANGES_MAX = int(os.getenv("MEMOIRE_ECHANGES_MAX", "12"))
 
 # RAG — documents de cours (PDF/TXT/MD) et index FAISS.
@@ -185,3 +246,4 @@ def assurer_repertoires() -> None:
     DOCUMENTS_DIR.mkdir(parents=True, exist_ok=True)
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
     LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    OPENCODE_CHAT_DIR.mkdir(parents=True, exist_ok=True)

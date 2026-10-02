@@ -12,6 +12,7 @@ from pathlib import Path
 from ..config import (
     ARBORESCENCE_CACHE_SECONDES,
     FICHIER_CONTEXTE_MAX_CAR,
+    FICHIER_CONTEXTE_MAX_LIGNES,
     FICHIERS_CONTEXTE_MAX,
     PROJETS_DIR,
 )
@@ -21,6 +22,88 @@ from .filtres import filtres_pour
 
 class CheminHorsProjet(ValueError):
     """Levée quand un chemin relatif tente de sortir du dossier racine."""
+
+
+class PatchInvalide(ValueError):
+    """Levée quand une opération de patch ne s'applique pas au fichier visé.
+
+    Distincte de `CheminHorsProjet` : ici le chemin est bon, c'est le contenu
+    qui ne correspond plus — le fichier a changé entre-temps, ou l'agent a
+    inventé un numéro de ligne.
+    """
+
+
+def appliquer_patch(contenu: str, operations: list[dict]) -> str:
+    """Applique des opérations de patch à *contenu* et renvoie le texte obtenu.
+
+    Une opération est `{"ligne": N, "suppression": k, "ajout": [...]}`, où `N`
+    est un numéro de ligne 1-based du fichier ACTUEL, `k` le nombre de lignes
+    consecutivees à remplacer (1 par défaut) et `ajout` les nouvelles lignes à
+    mettre à leur place.
+
+    Pourquoi des opérations plutôt qu'un fichier complet : demander à un modèle
+    de restituer un fichier entier est intenable dès que le fichier dépasse le
+    contexte envoyé — il abandonne, ou renvoie un fichier amputé. Ici le modèle
+    n'écrit que ce qui change, et le backend applique sur le contenu réel lu sur
+    le disque au moment de la proposition.
+
+    Les opérations sont appliquées de la FIN vers le DÉBUT : les numéros de
+    ligne restent valides au fur et à mesure, sans recalcul d'offset. Deux
+    opérations qui se chevauchent sont rejetées plutôt que fusionnées en silence,
+    car un chevauchement signale que le modèle raisonne sur un fichier différent
+    de celui qu'il a reçu.
+    """
+    if not operations:
+        raise PatchInvalide("aucune opération de patch.")
+
+    lignes = contenu.split("\n")
+    taille = len(lignes)
+
+    normalisees: list[tuple[int, int, list[str]]] = []
+    for op in operations:
+        if not isinstance(op, dict):
+            raise PatchInvalide(f"opération non objet : {op!r}")
+        try:
+            depart = int(op["ligne"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PatchInvalide(
+                f"opération sans numéro de ligne exploitable : {op!r}"
+            ) from exc
+        supp = op.get("suppression", 1)
+        try:
+            supp = int(supp)
+        except (TypeError, ValueError) as exc:
+            raise PatchInvalide(f"« suppression » illisible : {supp!r}") from exc
+        if depart < 1:
+            raise PatchInvalide(f"numéro de ligne {depart} : la numérotation démarre à 1.")
+        if supp < 1:
+            raise PatchInvalide(f"« suppression » doit valoir au moins 1, reçu {supp}.")
+        if depart + supp - 1 > taille:
+            raise PatchInvalide(
+                f"lignes {depart}-{depart + supp - 1} hors du fichier, "
+                f"qui n'en compte que {taille}."
+            )
+        ajout = op.get("ajout", [])
+        if isinstance(ajout, str):
+            ajout = [ajout]
+        if not isinstance(ajout, list) or not all(isinstance(l, str) for l in ajout):
+            raise PatchInvalide(f"« ajout » doit être une liste de lignes : {ajout!r}")
+        normalisees.append((depart, supp, list(ajout)))
+
+    normalisees.sort(key=lambda o: o[0], reverse=True)
+    for (d1, s1, _), (d2, s2, _) in zip(normalisees, normalisees[1:]):
+        # Trié par `ligne` décroissante, `normalisees[i+1]` est celle d'après.
+        # La première couvre [d1, d1+s1-1] et la suivante [d2, d2+s2-1] avec
+        # d1 >= d2 : elles se recouvrent si la seconde va jusqu'à d1.
+        if d2 + s2 - 1 >= d1:
+            raise PatchInvalide(
+                f"opérations qui se chevauchent : lignes {d1}-{d1 + s1 - 1} "
+                f"et {d2}-{d2 + s2 - 1}."
+            )
+
+    for depart, supp, ajout in normalisees:
+        lignes[depart - 1 : depart - 1 + supp] = ajout
+    return "\n".join(lignes)
 
 
 _ARBORESCENCES: dict[tuple[str, int], tuple[float, str]] = {}
@@ -133,9 +216,22 @@ def bloc_fichiers_contexte(
     chemins_contexte: list[str],
     racine: Path,
     limite: int = FICHIERS_CONTEXTE_MAX,
+    limite_car: int = FICHIER_CONTEXTE_MAX_CAR,
+    limite_lignes: int = FICHIER_CONTEXTE_MAX_LIGNES,
 ) -> str:
     """Lit et limite les fichiers de contexte (lu côté backend, jamais côté
-    frontend) — max FICHIER_CONTEXTE_MAX_CAR chacun, `limite` fichiers."""
+    frontend) - max `limite_car` caractères et `limite_lignes` lignes chacun,
+    `limite` fichiers.
+
+    Chaque ligne est préfixée de son numéro (`   12 | code`) : c'est ce qui
+    permet à l'agent de patcher le fichier en citant des lignes précises plutôt
+    qu'en réécrivant le fichier entier. Le préfixe est à six caractères de large,
+    donc aligné jusqu'à 999999 lignes.
+
+    `limite_car` et `limite_lignes` sont paramétrables parce que le mode Edit a
+    besoin d'un budget bien plus large que le Chat : il doit voir la ligne à
+    modifier, sinon il ne peut pas la situer.
+    """
     morceaux: list[str] = []
     for rel in [c for c in chemins_contexte if c][:limite]:
         try:
@@ -145,6 +241,11 @@ def bloc_fichiers_contexte(
         contenu = lire_fichier_ou(chemin, "")
         if not contenu:
             continue
-        contenu = contenu[:FICHIER_CONTEXTE_MAX_CAR]
-        morceaux.append(f"===FICHIER {rel}===\n{contenu}\n===FIN FICHIER===")
+        numeroes = "\n".join(
+            f"{i:>6} | {ligne}"
+            for i, ligne in enumerate(
+                contenu[:limite_car].split("\n")[:limite_lignes], 1
+            )
+        )
+        morceaux.append(f"===FICHIER {rel}===\n{numeroes}\n===FIN FICHIER===")
     return "\n\n".join(morceaux)

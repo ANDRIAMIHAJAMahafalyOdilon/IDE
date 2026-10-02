@@ -12,8 +12,14 @@ import logging
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
-from . import moteurs, workspace
-from ..config import ARBRE_CONTEXTE_MAX, CONTEXTE_MAX_CAR, FICHIERS_CONTEXTE_MAX, MEMOIRE_ECHANGES_MAX
+from . import moteurs, opencode, workspace
+from ..config import (
+    ARBRE_CONTEXTE_MAX,
+    CONTEXTE_MAX_CAR,
+    FICHIERS_CONTEXTE_MAX,
+    MEMOIRE_ECHANGES_MAX,
+    OPENCODE_CHAT_DIR,
+)
 
 # WARNING/ERROR et non INFO : aucune configuration de logging dans ce projet,
 # racine uvicorn en WARNING. Voir le commentaire détaillé dans `moteurs.py`.
@@ -210,6 +216,47 @@ def _premier_delta(flux: Iterator[str]) -> str | None:
 MoteurFlux = Callable[[str], Iterator[str]]
 
 
+def _tronconner(texte: str, taille: int = 80) -> Iterator[str]:
+    """Découpe une réponse complète en fragments pour l'affichage progressif.
+
+    Les coupures se font sur une espace ou un retour à la ligne, jamais au
+    caractère près : une coupure en plein milieu d'un mot s'affiche comme du
+    texte incohérent alors que la réponse, elle, est parfaitement correcte. Les
+    espaces sont conservés, donc la concaténation redonne exactement `texte`.
+    """
+    reste = texte
+    while reste:
+        if len(reste) <= taille:
+            yield reste
+            return
+        fenetre = reste[:taille]
+        coupe = max(fenetre.rfind(" "), fenetre.rfind("\n"))
+        if coupe <= 0:
+            # Aucun mot court dans la fenêtre : un texte sans espace (chemin,
+            # code collé) n'a pas de frontière à respecter.
+            coupe = taille
+        yield reste[: coupe + 1]
+        reste = reste[coupe + 1 :]
+
+
+def _flux_opencode(prompt: str) -> Iterator[str]:
+    """Réponse du moteur OpenCode, découpée pour l'affichage progressif.
+
+    `repondre_chat` rend la réponse complète (l'endpoint message ne streame pas).
+    Le découpage restitue une progression lisible sans parser le flux SSE, dont
+    la gestion des parties a déjà causé des doublons de texte par le passé.
+    `ErreurOpenCode` est traduite en `ErreurMoteur` : sans cela, la bascule vers
+    les moteurs suivants de `stream_reponse` ne se ferait pas.
+    """
+    try:
+        texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt)
+    except opencode.ErreurOpenCode as exc:
+        raise moteurs.ErreurMoteur("moteur_indisponible", f"opencode : {exc.message}") from exc
+    if not texte:
+        raise moteurs.ErreurMoteur("moteur_indisponible", "opencode : réponse vide.")
+    yield from _tronconner(texte)
+
+
 def _engins() -> list[tuple[str, MoteurFlux]]:
     """Chaîne de repli du Chat, résolue à chaque appel.
 
@@ -217,8 +264,24 @@ def _engins() -> list[tuple[str, MoteurFlux]]:
     une liste constante capturerait les objets fonction d'origine, et toute
     substitution de `moteurs.gemini_flux` (tests, bascule de moteur) serait
     silencieusement ignorée.
+
+    OpenCode est EN TÊTE, toujours, sans condition de clé.
+
+    L'utilisateur attend « je réponds avec le moteur embarqué, gratuitement ».
+    La présence d'une clé Gemini dans le .env ne doit pas suffire à détourner la
+    conversation vers un service distant payant ou quota-limité : cette clé sert
+    à la recherche web et à l'indexation des documents, pas à choisir le moteur
+    d'une simple réponse.
+
+    Gemini et Groq restent en SECOURS — ce qu'ils étaient avant que le moteur
+    embarqué existe. Ils ne sont tentés que si OpenCode échoue, ce qui laisse la
+    bascule intacte sans jamais en faire le choix par défaut.
     """
-    return [("gemini", moteurs.gemini_flux), ("groq", moteurs.groq_flux)]
+    return [
+        ("opencode", _flux_opencode),
+        ("gemini", moteurs.gemini_flux),
+        ("groq", moteurs.groq_flux),
+    ]
 
 
 def stream_reponse(prompt: str) -> Iterator[tuple[str, Any]]:

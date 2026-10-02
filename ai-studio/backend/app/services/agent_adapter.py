@@ -160,7 +160,7 @@ def _valider(propos: list[dict], racine: Path) -> list[dict]:
     valides: list[dict] = []
     for prop in propos:
         action = str(prop.get("action", "")).strip()
-        if action not in ("write", "delete"):
+        if action not in ("patch", "write", "delete"):
             raise ErreurAdaptateur(
                 "schema_invalide", f"action inconnue : {action!r}",
                 fichier=str(prop.get("fichier") or "") or None,
@@ -174,6 +174,21 @@ def _valider(propos: list[dict], racine: Path) -> list[dict]:
                     "schema_invalide", "contenu manquant pour un fichier à écrire.",
                     fichier=fichier,
                 )
+        if action == "patch":
+            operations = prop.get("operations")
+            if not isinstance(operations, list) or not operations:
+                raise ErreurAdaptateur(
+                    "schema_invalide",
+                    "« operations » doit être une liste non vide pour un patch.",
+                    fichier=fichier,
+                )
+            for op in operations:
+                if not isinstance(op, dict) or "ligne" not in op:
+                    raise ErreurAdaptateur(
+                        "schema_invalide",
+                        f"opération de patch invalide (« ligne » obligatoire) : {str(op)[:120]!r}",
+                        fichier=fichier,
+                    )
         try:
             workspace.chemin_securise(racine, fichier)
         except workspace.CheminHorsProjet as exc:
@@ -216,30 +231,41 @@ def construire_prompt(
     arborescence: str,
     bloc_fichiers: str,
     memoire: str,
+    budget_car: int = CONTEXTE_MAX_CAR,
 ) -> str:
     """Prompt canonique pour le moteur (format strict).
 
     Le prompt système et la consigne JSON finale sont TOUJOURS gardés ; seuls
     les blocs de contexte (mémoire puis fichiers) portent le poids du plafond
     CONTEXTE_MAX_CAR (~3 800 tokens, sous les 8 000 TPM de Groq).
+
+    `budget_car` est surchargé par le mode EDIT, qui envoie un budget plus large
+    : le patch se fait par numéros de ligne, donc la zone à modifier doit être
+    réellement présente dans le contexte.
     """
     consigne = (
         "\nConsigne :\n"
         f"{instruction}\n\n"
-        "Réponds STRICTEMENT en JSON, sans aucun texte autour :\n"
-        'une liste [{"action": "write", "fichier": "chemin/relatif.ext", '
-        '"contenu": "<fichier complet>"}, {"action": "delete", '
-        '"fichier": "chemin/relatif.ext"}].\n'
+        "Réponds STRICTEMENT en JSON, sans aucun texte autour, sous la forme :\n"
+        '[{"action": "patch", "fichier": "chemin/relatif.ext", "operations": '
+        '[{"ligne": 42, "suppression": 1, "ajout": ["ligne de remplacement"]}]}].\n'
+        "« ligne » est le numéro de ligne tel qu'il apparaît dans le contexte, il "
+        "débute à 1 ; « suppression » vaut le nombre de lignes existantes à "
+        "remplacer (1 par défaut) ; « ajout » contient les nouvelles lignes, qui "
+        "prennent leur place.\n"
+        "PREFERE le patch : il ne demande que les lignes qui changent. N'écris le "
+        "fichier COMPLET (\"action\": \"write\") que si le fichier est minuscule, "
+        "et supprime un fichier entier avec {\"action\": \"delete\", "
+        "\"fichier\": \"chemin/relatif.ext\"}.\n"
         "Ne propose des modifications QUE si c'est nécessaire pour satisfaire "
-        "la consigne. Pour un `write`, `contenu` doit être le fichier COMPLET "
-        "(jamais un fragment)."
+        "la consigne. Réponds [] si rien ne doit changer."
     )
     systeme = (
         "Tu es l'assistant d'édition d'un IDE. Ne lis et n'écris AUCUN fichier : "
         "réponds uniquement avec le contexte fourni ci-dessous."
     )
     budget = max(
-        0, CONTEXTE_MAX_CAR - len(systeme) - len(consigne) - len(arborescence) - 40
+        0, budget_car - len(systeme) - len(consigne) - len(arborescence) - 40
     )
     retenus = _tronquer_prioritaire(
         [

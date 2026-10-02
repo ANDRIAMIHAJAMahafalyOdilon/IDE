@@ -43,13 +43,30 @@ class ErreurOpenCode(Exception):
 SYSTEM_PROMPT = (
     "Tu es l'assistant d'édition d'un IDE. Tu ne peux PAS lire ni écrire de "
     "fichier, ni lancer de commande : tu travailles uniquement à partir du "
-    "contexte fourni dans le message. Quand une modification est demandée, "
-    "propose les fichiers complets à écrire ou à supprimer. Réponds STRICTEMENT "
-    "en JSON : une liste d'objets de la forme "
-    '{"action": "write", "fichier": "chemin/relatif.ext", "contenu": "fichier '
-    'complet"} ou {"action": "delete", "fichier": "chemin/relatif.ext"}. '
-    "Aucun texte hors de cette liste, aucun bloc de code markdown autour."
+    "contexte fourni dans le message, où chaque ligne est précédée de son "
+    "numéro. Ne réécris JAMAIS un fichier entier : réponds uniquement par les "
+    "lignes qui changent, sous la forme d'une liste JSON "
+    '[{"action": "patch", "fichier": "chemin/relatif.ext", "operations": '
+    '[{"ligne": 42, "suppression": 1, "ajout": ["nouvelle ligne"]}]}]. '
+    '"ligne" est le numéro affiché dans le contexte (il commence à 1), '
+    '"suppression" le nombre de lignes existantes à remplacer, "ajout" les '
+    'nouvelles lignes. Renvoie [] si rien ne doit changer, et jamais de texte '
+    'autour du JSON.'
 )
+
+# Agent OpenCode du mode Chat, défini dans opencode.jsonc avec TOUS les outils en
+# `deny`. Le nom doit correspondre exactement à la clé `agent.discussion` du
+# fichier : une faute de frappe ferait retomber OpenCode sur l'agent par défaut
+# (`build`), qui est autorisé à écrire et à exécuter des commandes.
+CHAT_AGENT = "discussion"
+
+# Agent du mode Edit. Distinct de CHAT_AGENT parce que les deux ne veulent pas la
+# même chose : la discussion écrit des outils, le proposeur d'édition ne doit
+# RIEN toucher. Les deux partagent le serveur 4096, donc héritent du
+# `bash: "allow"` global. Sans agent dédié, l'Edit exécuterait des commandes
+# alors que sa seule sortie attendue est une proposition de modification — et il
+# perdrait du temps à explorer le projet avant de répondre.
+EDIT_AGENT = "proposition"
 
 
 def _client(timeout: float = OPENCODE_TIMEOUT, agent: bool = False) -> httpx.Client:
@@ -112,12 +129,17 @@ def envoyer_instruction(sid: str, directory: str | Path, texte: str) -> str:
     qu'une proposition. Le contrat serveur
     `POST /session/:id/message { messageID?, model?, agent?, noReply?, system?,
     tools?, parts }` l'accepte à chaque tour — d'où l'envoi systématique.
+
+    `agent` désigne l'agent `proposition` (cf. opencode.jsonc), dont tous les
+    outils sont refusés. C'est la garantie STRUCTURELLE du contrat : une consigne
+    dans le prompt peut être ignorée par le modèle, une permission non.
     """
     try:
         resp = _client().post(
             f"/session/{sid}/message",
             json={
                 "system": SYSTEM_PROMPT,
+                "agent": EDIT_AGENT,
                 "parts": [{"type": "text", "text": texte}],
             },
             headers={"x-opencode-directory": str(Path(directory).resolve())},
@@ -151,6 +173,49 @@ def _extraire_texte_final(resultat: dict) -> str:
             morceaux.append(partie["text"])
     return "\n".join(m for m in morceaux if m).strip()
 
+
+def repondre_chat(directory: str | Path, prompt: str, timeout: float | None = None) -> str:
+    """Un tour de discussion libre, sans aucun outil, et retourne le texte final.
+
+    L'agent `discussion` (cf. opencode.jsonc) porte le contrat « aucun outil » :
+    le Chat partage le serveur du mode Edit (4096), donc les permissions globales
+    ne suffisent pas — laisser `bash` en `ask` ferait patienter une demande de
+    permission que personne ne peut valider ici, et la réponse resterait bloquée.
+    Le prompt de discussion contient DÉJÀ tout le contexte (arborescence, mémoire,
+    fichiers) : l'agent n'a rien à lire ni à exécuter.
+    """
+    racine = str(Path(directory).resolve())
+    Path(racine).mkdir(parents=True, exist_ok=True)
+    assurer_serveur(racine)
+    sid = creer_session(racine, "AI Studio · Chat", agent=False)
+    budget = OPENCODE_TIMEOUT if timeout is None else timeout
+    try:
+        resp = _client(budget).post(
+            f"/session/{sid}/message",
+            json={
+                "agent": CHAT_AGENT,
+                "parts": [{"type": "text", "text": prompt}],
+            },
+            headers={"x-opencode-directory": racine},
+        )
+        resp.raise_for_status()
+    except httpx.ConnectError as exc:
+        raise ErreurOpenCode(
+            "serveur_indisponible", f"Serveur OpenCode injoignable : {exc}"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise ErreurOpenCode(
+            "timeout", f"OpenCode n'a pas répondu en {int(budget)} s."
+        ) from exc
+    except httpx.HTTPStatusError as exc:
+        raise ErreurOpenCode(
+            "serveur_indisponible",
+            f"Erreur {exc.response.status_code} lors de l'envoi.",
+        ) from exc
+
+    return _extraire_texte_final(resp.json())
+
+
 # ─────────────────────── Exécution autonome headless ───────────────────────
 
 _SERVEUR_PROCESS: subprocess.Popen | None = None
@@ -158,6 +223,154 @@ _SERVEUR_PROCESS: subprocess.Popen | None = None
 # signifie deux environnements distincts : c'est la garantie structurelle que
 # `AISTUDIO_AGENT` ne peut pas atteindre la session interactive de l'utilisateur.
 _SERVEUR_AGENT_PROCESS: subprocess.Popen | None = None
+
+# Date de modification de la config au moment où chaque serveur a été démarré.
+# Sert au diagnostic : elle permet de constater qu'un serveur tourne avec une
+# configuration abandonnée sans avoir à le deviner.
+_CONFIG_MT_SERVEUR: dict[str, float] = {}
+# Base déjà contrôlée dans CE process : inutile de re-tuer un serveur qu'on vient
+# de démarrer soi-même.
+_VETEE: set[str] = set()
+
+
+def _mtime_config() -> float:
+    try:
+        return OPENCODE_CONFIG.stat().st_mtime
+    except OSError:
+        return 0.0
+
+
+def _port_de(base: str) -> int:
+    return urlparse(base).port or 4096
+
+
+def _sortie(cmd: list[str]) -> str:
+    """Lance une commande Windows et renvoie sa sortie, sans jamais échouer.
+
+    `netstat` et `tasklist` n'écrivent pas en UTF-8 : sur une Windows française,
+    le décodage cp1252 par défaut lève `UnicodeDecodeError` sur le moindre octet
+    accentué, ce qui transformerait une simple détection de port en exception.
+    """
+    try:
+        proc = subprocess.run(
+            cmd, capture_output=True, timeout=15,
+            encoding="utf-8", errors="replace",
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return proc.stdout or ""
+
+
+def _pid_ecoutant(port: int) -> int | None:
+    """PID du processus qui écoute `port`, ou None. Windows uniquement.
+
+    L'état d'une connexion est traduit par Windows (« LISTENING » en anglais,
+    « EN ÉCOUTE » en français) : le comparer à une chaîneanglaise marche sur une
+    machine anglophone et jamais sur une autre. On ne teste donc pas l'état, mais
+    l'adresse distante, qui vaut `0.0.0.0:0` pour une socket en écoute — un fait
+    du format, pas de la localisation.
+    """
+    if os.name != "nt":
+        return None
+    cible = f":{port}"
+    for ligne in _sortie(["netstat", "-ano", "-p", "TCP"]).splitlines():
+        champs = ligne.split()
+        if len(champs) < 5 or champs[0].upper() != "TCP":
+            continue
+        if champs[1].endswith(cible) and champs[2] == "0.0.0.0:0":
+            try:
+                return int(champs[4])
+            except ValueError:
+                return None
+    return None
+
+
+def _est_opencode(pid: int) -> bool:
+    """Vrai si `pid` est bien un serveur OpenCode.
+
+    Garde-fou indispensable : `_renouveler_serveur` ne doit jamais arrêter un
+    processus qui a juste le malheur d'occuper le port — un port occupé par
+    autre chose est un conflit de port, pas un serveur périmé.
+    """
+    if os.name != "nt":
+        return False
+    return "opencode" in _sortie(
+        ["tasklist", "/FI", f"PID eq {pid}", "/FO", "CSV", "/NH"]
+    ).lower()
+
+
+def _config_du_serveur(base: str) -> dict[str, Any] | None:
+    """Configuration que le serveur en face a réellement chargée, ou None.
+
+    `GET /config` répond la configuration effective, config d'environnement
+    comprise. C'est la seule preuve fiable : un serveur déjà lancé peut venir de
+    n'importe quelle configuration, y compris celle de l'utilisateur.
+    """
+    try:
+        rep = httpx.get(f"{base}/config", timeout=5)
+        rep.raise_for_status()
+        donnees = rep.json()
+    except (httpx.HTTPError, ValueError):
+        return None
+    return donnees if isinstance(donnees, dict) else None
+
+
+def _tourne_avec_notre_config(base: str) -> bool:
+    """Vrai si le serveur a chargé la configuration d'AI Studio, À JOUR.
+
+    Les agents `discussion` et `proposition` n'existent que dans notre
+    `opencode.jsonc`. Les retrouver prouve que le serveur a bien lu NOTRE
+    fichier, donc qu'il s'agit d'un serveur à nous — un démarrage précédent de
+    l'application — et non d'un `opencode serve` de l'utilisateur.
+
+    Exiger les DEUX est ce qui rend la détection d'une mise à jour : une
+    installation antérieure a un serveur qui connaît `discussion` mais ignore
+    `proposition`, ajouté plus tard. Sans cette exigence, l'Edit tomberait en
+    silence sur l'agent par défaut, qui a le droit d'écrire et d'exécuter.
+
+    À ne PAS confondre avec « il applique les permissions du fichier » : ce
+    n'est pas vrai. Le serveur retient sa configuration au DÉMARRAGE.
+    """
+    config = _config_du_serveur(base)
+    if config is None:
+        return False
+    agents = config.get("agent")
+    if not isinstance(agents, dict):
+        return False
+    return all(nom in agents for nom in (CHAT_AGENT, EDIT_AGENT))
+
+
+def _renouveler_serveur(base: str) -> bool:
+    """Force le serveur de `base` à recharger la configuration d'AI Studio.
+
+    Un OpenCode lit sa configuration au DÉMARRAGE et la garde en mémoire : un
+    serveur déjà en écoute sert donc les permissions qu'il avait au moment où il
+    a démarré, pas celles du fichier. Constaté ici : le serveur répondait
+    `"bash": "ask"` alors que opencode.jsonc disait `"allow"`. Corriger le
+    fichier ne changeait donc rien, et l'agent Edit restait bloqué sur une
+    permission que l'utilisateur croyait avoir levée.
+
+    Seuls les serveurs À NOUS sont arrêtés, reconnaissables à leur agent
+    `discussion`. Un `opencode serve` lancé par l'utilisateur pour sa propre
+    session n'est jamais touché : `_renouveler_serveur` renvoie alors False et
+    l'appelant se contente de l'utiliser.
+    """
+    port = _port_de(base)
+    if not _sante(base) or not _tourne_avec_notre_config(base):
+        return False
+    pid = _pid_ecoutant(port)
+    if pid is None or not _est_opencode(pid):
+        return False
+    logger.warning(
+        "serveur_perime port=%s pid=%s — redemarrage pour recharger la config", port, pid
+    )
+    _sortie(["taskkill", "/PID", str(pid), "/F"])
+    limite = time.monotonic() + 15
+    while time.monotonic() < limite:
+        if not _sante(base):
+            return True
+        time.sleep(0.25)
+    return False
 
 
 def _serveur_binaire() -> str:
@@ -234,13 +447,26 @@ def _demarrer_serveur(
 
 
 def assurer_serveur(directory: str | Path) -> None:
-    """Serveur du mode discussion (port 4096), sans aucun flag agent."""
+    """Serveur du mode discussion (port 4096), sans aucun flag agent.
+
+    Le contrôle de configuration a lieu UNE FOIS par process (`_VETEE`) : le
+    serveur étant relancé à ce moment-là, il sert la config courante. Les
+    appels suivants — un par question au chat — réutilisent ce serveur sans
+    repasser par un `/config`.
+    """
     global _SERVEUR_PROCESS
     if verifier_serveur():
-        return
+        if OPENCODE_BASE_URL in _VETEE:
+            return
+        _VETEE.add(OPENCODE_BASE_URL)
+        if not _renouveler_serveur(OPENCODE_BASE_URL):
+            # Serveur de l'utilisateur, ou port pris par autre chose : on ne le
+            # détruit pas, on tente de s'en servir.
+            return
     if _SERVEUR_PROCESS is not None and _SERVEUR_PROCESS.poll() is not None:
         _SERVEUR_PROCESS = None
     _SERVEUR_PROCESS = _demarrer_serveur(directory, OPENCODE_BASE_URL, agent=False)
+    _CONFIG_MT_SERVEUR[OPENCODE_BASE_URL] = _mtime_config()
 
 
 def assurer_serveur_agent(directory: str | Path) -> None:
@@ -254,6 +480,7 @@ def assurer_serveur_agent(directory: str | Path) -> None:
     global _SERVEUR_AGENT_PROCESS
     if verifier_serveur_agent():
         return
+    _VETEE.discard(OPENCODE_AGENT_BASE_URL)
     if _SERVEUR_AGENT_PROCESS is not None and _SERVEUR_AGENT_PROCESS.poll() is not None:
         _SERVEUR_AGENT_PROCESS = None
     _SERVEUR_AGENT_PROCESS = _demarrer_serveur(
@@ -270,6 +497,8 @@ def arreter_serveur() -> None:
     l'utilisateur (`_SERVEUR_PROCESS is None`) n'est jamais tué.
     """
     global _SERVEUR_PROCESS, _SERVEUR_AGENT_PROCESS
+    _CONFIG_MT_SERVEUR.clear()
+    _VETEE.clear()
     for attr in ("_SERVEUR_PROCESS", "_SERVEUR_AGENT_PROCESS"):
         proc = globals().get(attr)
         globals()[attr] = None
