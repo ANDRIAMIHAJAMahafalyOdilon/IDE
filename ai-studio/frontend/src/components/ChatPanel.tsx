@@ -2,19 +2,23 @@ import { memo, useEffect, useMemo, useRef, useState } from "react";
 import {
   appliquerModifs,
   arreterTache,
+  attacherPieces,
   chatAgent,
-  choisirDossierNatif,
   etatTache,
   etatFichiers,
   listerDocuments,
+  listerPieces,
   reindexerIndex,
   repondrePermission as repondrePermissionApi,
+  retirerPiece,
+  choisirDossierNatif,
   tacheAgent,
+  urlPiece,
   uploaderDocument,
 } from "../api/client";
 import type { ReponseDocuments } from "../api/client";
-import { useDiscussions } from "../store/discussions";
-import type { MessageDisc } from "../store/discussions";
+import { genererIdMessage, useDiscussions } from "../store/discussions";
+import type { MessageDisc, PieceMessage } from "../store/discussions";
 import { useStudio } from "../store/studio";
 import type {
   EvenementTache,
@@ -40,16 +44,57 @@ const ETIQUETTES_ERREUR: Record<string, string> = {
   permission_indisponible: "Permission Roch indisponible",
   opencode: "Erreur Roch",
   piece_invalide: "Pièce jointe refusée",
+  hors_ligne: "Application injoignable",
   interne: "Erreur interne",
 };
 
-/** Pièce jointe prête à partir : le contenu est déjà en base64. */
+/** Pièce jointe du fil. `donnees` est absent une fois la pièce confiée au backend :
+ *  seule l'inventaire du fil est ensuite affiché, et le backend réinjecte le
+ *  contenu à chaque requête sans que le navigateur le renvoie. */
 interface PieceUI {
   cle: string;
   nom: string;
   mime: string;
   ko: number;
-  donnees: string;
+  size?: number;
+  tailleOctets?: number;
+  donnees?: string;
+  apercu?: string;
+  etat?: "selected" | "uploading" | "processing" | "ready" | "error";
+  pages?: number | null;
+  created_at?: string | null;
+  message_id?: string | null;
+}
+
+function taillePiece(ko: number): string {
+  if (ko >= 1024) return `${(ko / 1024).toFixed(1)} Mo`;
+  return `${ko} Ko`;
+}
+
+function pieceVersMessage(piece: PieceUI): PieceMessage {
+  return {
+    id: piece.cle,
+    message_id: piece.message_id ?? undefined,
+    filename: piece.nom,
+    mime_type: piece.mime,
+    size: piece.size ?? piece.tailleOctets ?? piece.ko * 1024,
+    status: piece.etat ?? "ready",
+    pages: piece.pages,
+    previewUrl: piece.apercu,
+  };
+}
+
+/** Erreur de transport : le backend ne répond pas. « Failed to fetch » ne dit rien
+ *  d'utile à l'utilisateur — c'est lui qui doit savoir s'il doit rouvrir l'app. */
+function erreurReseau(e: unknown): { code: string; message: string } {
+  const brut = e instanceof Error ? e.message : String(e);
+  if (/failed to fetch|networkerror|load failed|failed to load|impossible de joindre|connexion interrompue/i.test(brut)) {
+    return {
+      code: "hors_ligne",
+      message: "L'application ne répond plus. Ferme cette fenêtre et relance AIStudio.exe.",
+    };
+  }
+  return { code: "interne", message: brut };
 }
 
 /** Mêmes plafonds que `services/pieces_jointe.py` : inutile d'envoyer 12 Mo
@@ -65,17 +110,41 @@ const MIMES_PIECE = [
   "application/pdf",
 ];
 
-function lireEnBase64(fichier: File): Promise<string> {
+function lireEnBase64(
+  fichier: File,
+  onProgress?: (octetsLus: number) => void,
+): Promise<string> {
   return new Promise((resoudre, rejeter) => {
     const lecteur = new FileReader();
     lecteur.onerror = () => rejeter(new Error(`Lecture impossible : ${fichier.name}`));
+    lecteur.onprogress = (event) => {
+      if (event.lengthComputable) onProgress?.(event.loaded);
+    };
     lecteur.onload = () => {
       const resultat = String(lecteur.result ?? "");
       const virgule = resultat.indexOf(",");
+      onProgress?.(fichier.size);
       resoudre(virgule >= 0 ? resultat.slice(virgule + 1) : resultat);
     };
     lecteur.readAsDataURL(fichier);
   });
+}
+
+/** Fusion des pièces locales avant le premier message (le fil backend n'existe pas
+ *  encore). Le plafond est la limite du FIL, pas du message : une pièce oubliée
+ *  fait de la place pour les suivantes. */
+function fusionnerPieces(
+  precedentes: PieceUI[],
+  ajoutees: PieceUI[],
+  refusees: string[],
+): PieceUI[] {
+  const deja = new Set(precedentes.map((p) => p.cle));
+  const fusion = [...precedentes, ...ajoutees.filter((p) => !deja.has(p.cle))];
+  if (fusion.length > PIECE_MAX) {
+    refusees.push(`${PIECE_MAX} pièces maximum par conversation`);
+    return fusion.slice(0, PIECE_MAX);
+  }
+  return fusion;
 }
 
 /** Windows et certains sélecteurs envoient un mime vide : l'extension décide. */
@@ -93,19 +162,42 @@ interface BulleChatProps {
   message: MessageDisc;
   dernier: boolean;
   busy: boolean;
+  session?: string | null;
 }
 
 /** Bulle de discussion mémoïsée : seuls les changements de texte re-parsent le
  * Markdown (un delta SSE ne re-rend que la dernière bulle, pas tout le fil). */
-const BulleChat = memo(function BulleChat({ message, dernier, busy }: BulleChatProps) {
+const BulleChat = memo(function BulleChat({ message, dernier, busy, session }: BulleChatProps) {
   return (
     <div className={"msg-chat msg-" + message.role}>
       <div className="msg-bulle">
-        {message.role === "assistant" ? (
-          <Markdown texte={message.texte || ""} />
-        ) : (
-          message.texte ||
-          (busy && dernier ? "…" : "")
+        {message.attachments?.length ? (
+          <div className="message-pieces" aria-label="Pièces jointes du message">
+            {message.attachments.map((piece) => (
+              <div className="message-piece" key={piece.id}>
+                {piece.mime_type.startsWith("image/") ? (
+                  (piece.previewUrl ?? (session ? urlPiece(session, piece.id) : undefined)) ? (
+                    <img className="message-piece-thumb" src={piece.previewUrl ?? (session ? urlPiece(session, piece.id) : "")} alt="" />
+                  ) : (
+                    <span className="message-piece-thumb-placeholder" aria-hidden="true">▧</span>
+                  )
+                ) : (
+                  <span className="message-piece-pdf" aria-hidden="true">PDF</span>
+                )}
+                <span className="message-piece-info">
+                  <strong title={piece.filename}>{piece.filename}</strong>
+                  <small>{taillePiece(Math.ceil(piece.size / 1024))} · ✓ Ready</small>
+                </span>
+              </div>
+            ))}
+          </div>
+        ) : null}
+        {(message.texte || (busy && dernier)) && (
+          <div className="message-content">
+            {message.role === "assistant"
+              ? <Markdown texte={message.texte || ""} />
+              : message.texte || "…"}
+          </div>
         )}
       </div>
     </div>
@@ -203,11 +295,19 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [docsErreur, setDocsErreur] = useState<string | null>(null);
   const [docsBusy, setDocsBusy] = useState(false);
   const fichierInputRef = useRef<HTMLInputElement | null>(null);
-  // Pièces jointes du message en cours (Chat uniquement) : elles partent avec
-  // l'envoi puis sont vidées, faute de quoi la pièce resterait attachée au
-  // message suivant — l'utilisateur enverrait la photo une seconde fois.
+  // Pièces jointes retenues par la discussion (Chat uniquement). Une fois
+  // confiées au backend, seules leurs métadonnées restent dans le navigateur :
+  // le contenu est réinjecté côté serveur à chaque question du même fil.
   const [pieces, setPieces] = useState<PieceUI[]>([]);
+  const piecesNouvellesRef = useRef<PieceUI[]>([]);
+  const [piecesBusy, setPiecesBusy] = useState(false);
+  const [piecesPhase, setPiecesPhase] = useState<"lecture" | "envoi">("lecture");
+  const [piecesProgress, setPiecesProgress] = useState(0);
   const pieceInputRef = useRef<HTMLInputElement | null>(null);
+  const [erreurDossier, setErreurDossier] = useState<string | null>(null);
+  const dossierLocal = useStudio((s) => s.dossierLocal);
+  const ouvrirDossierLocal = useStudio((s) => s.ouvrirDossierLocal);
+  const [choisitDossier, setChoisitDossier] = useState(false);
   // Cartes REPLIÉES, et non dépliées : le vide signifie « tout déplié ». Voir
   // `deployee` plus bas — le diff est visible dès son arrivée, c'est l'information
   // que l'utilisateur attend d'une proposition.
@@ -231,6 +331,20 @@ export function ChatPanel({ projet }: ChatPanelProps) {
   const [tacheActive, setTacheActive] = useState(false);
   const [erreur, setErreur] = useState<{ code: string; message: string } | null>(null);
   const [erreurChat, setErreurChat] = useState<{ code: string; message: string } | null>(null);
+
+  async function choisirDossierViaFenetre() {
+    if (choisitDossier || busy) return;
+    setErreurDossier(null);
+    setChoisitDossier(true);
+    try {
+      const chemin = await choisirDossierNatif();
+      if (chemin) await ouvrirDossierLocal(chemin);
+    } catch (e) {
+      setErreurDossier(e instanceof Error ? e.message : String(e));
+    } finally {
+      setChoisitDossier(false);
+    }
+  }
 
   const enChat = modeAgent === "chat";
   const moteurAff = enChat ? (active?.moteur ?? null) : moteurEdit;
@@ -386,29 +500,6 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     };
   }, [menuPlus]);
 
-  // Ouverture du dossier à modifier (edit) : le « ＋ » ouvre la VRAIE fenêtre
-  // Windows via le backend (aucune copie : open-local référence le disque tel quel).
-  const [erreurDossier, setErreurDossier] = useState<string | null>(null);
-  const dossierLocal = useStudio((s) => s.dossierLocal);
-  const ouvrirDossierLocal = useStudio((s) => s.ouvrirDossierLocal);
-
-  // Mode biseau de la fenêtre système : la requête reste ouverte le temps du
-  // choix (backend bloqué sur la fenêtre, serveur toujours disponible).
-  const [choisitDossier, setChoisitDossier] = useState(false);
-  async function choisirDossierViaFenetre() {
-    if (choisitDossier || busy) return;
-    setErreurDossier(null);
-    setChoisitDossier(true);
-    try {
-      const chemin = await choisirDossierNatif();
-      if (chemin) await ouvrirDossierLocal(chemin);
-    } catch (e) {
-      setErreurDossier(e instanceof Error ? e.message : String(e));
-    } finally {
-      setChoisitDossier(false);
-    }
-  }
-
   async function uploaderCours(fichiers: FileList | null) {
     const fichier = fichiers?.[0];
     if (!fichier) return;
@@ -425,46 +516,197 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     }
   }
 
-  async function choisirPieces(fichiers: FileList | null) {
+  /** La pièce rejoint le fil dès qu'elle est choisie, pas au moment de l'envoi :
+   *  c'est ce qui permet d'en reparler trois questions plus tard. Même avant le
+   *  premier message, on crée un identifiant de discussion et on le donne au
+   *  backend immédiatement : le PDF n'est donc jamais seulement « en attente »
+   *  dans le composant React. */
+  async function attacher(fichiers: FileList | null) {
     const choisis = Array.from(fichiers ?? []);
     if (!choisis.length) return;
+    if (busy || piecesBusy) return;
+    setPiecesBusy(true);
+    setPiecesPhase("lecture");
+    setPiecesProgress(0);
     setDocsErreur(null);
     const refusees: string[] = [];
     const ajoutees: PieceUI[] = [];
-    for (const fichier of choisis) {
-      const mime = fichier.type || mimeDevine(fichier.name);
-      if (!MIMES_PIECE.includes(mime)) {
-        refusees.push(`${fichier.name} : type non pris en charge`);
-        continue;
-      }
-      const plafond = mime === "application/pdf" ? PDF_MAX : IMAGE_MAX;
-      if (fichier.size > plafond) {
-        refusees.push(`${fichier.name} : trop lourd (${Math.round(fichier.size / 1_000_000)} Mo)`);
-        continue;
-      }
-      try {
-        ajoutees.push({
-          cle: `${fichier.name}-${fichier.size}-${fichier.lastModified}`,
+    try {
+      const totalOctets = choisis.reduce((total, fichier) => total + fichier.size, 0) || 1;
+      let octetsPrecedents = 0;
+      for (const fichier of choisis) {
+        const mime = fichier.type || mimeDevine(fichier.name);
+        if (!MIMES_PIECE.includes(mime)) {
+          refusees.push(`${fichier.name} : type non pris en charge`);
+          continue;
+        }
+        const plafond = mime === "application/pdf" ? PDF_MAX : IMAGE_MAX;
+        if (fichier.size > plafond) {
+          refusees.push(`${fichier.name} : trop lourd (${Math.round(fichier.size / 1_000_000)} Mo)`);
+          continue;
+        }
+        const cleLocale = `${fichier.name}-${fichier.size}-${fichier.lastModified}`;
+        const base: PieceUI = {
+          cle: cleLocale,
           nom: fichier.name,
           mime,
           ko: Math.max(1, Math.round(fichier.size / 1024)),
-          donnees: await lireEnBase64(fichier),
-        });
-      } catch (e) {
-        refusees.push(e instanceof Error ? e.message : String(e));
+          tailleOctets: fichier.size,
+          etat: "selected",
+        };
+        setPieces((precedentes) => fusionnerPieces(precedentes, [base], []));
+        setPieces((precedentes) => precedentes.map((piece) =>
+          piece.cle === cleLocale ? { ...piece, etat: "uploading" as const } : piece,
+        ));
+        try {
+          const donnees = await lireEnBase64(fichier, (lus) => {
+            setPiecesProgress(Math.min(90, Math.round(((octetsPrecedents + lus) / totalOctets) * 90)));
+          });
+          octetsPrecedents += fichier.size;
+          const preparee: PieceUI = {
+            ...base,
+            nom: fichier.name,
+            mime,
+            ko: Math.max(1, Math.round(fichier.size / 1024)),
+            donnees,
+            apercu: mime.startsWith("image/") ? `data:${mime};base64,${donnees}` : undefined,
+            etat: "processing",
+          };
+          ajoutees.push(preparee);
+          setPieces((precedentes) => precedentes.map((piece) =>
+            piece.cle === cleLocale ? preparee : piece,
+          ));
+        } catch (e) {
+          refusees.push(e instanceof Error ? e.message : String(e));
+          octetsPrecedents += fichier.size;
+          setPieces((precedentes) => precedentes.map((piece) =>
+            piece.cle === cleLocale ? { ...piece, etat: "error" as const } : piece,
+          ));
+        }
       }
+      if (refusees.length) setDocsErreur(refusees.join(" · "));
+      if (!ajoutees.length) return;
+
+      if (!enChat) {
+        // En mode Edit, on garde le fichier dans le composeur jusqu'à l'envoi
+        // de la consigne ; le backend le persistera avec la session Edit.
+        setPieces((precedentes) => fusionnerPieces(precedentes, ajoutees, []));
+        return;
+      }
+
+      const historique = useDiscussions.getState();
+      let id = activeId;
+      if (!id) id = historique.nouvelle("chat");
+      const session = useDiscussions
+        .getState()
+        .sessions.find((x) => x.id === id);
+      // Avant le premier message, l'identifiant frontend sert aussi d'identifiant
+      // backend. Il reste stable dans le store persisté et permet de retrouver les
+      // pièces après un rerender, un changement de mode ou un rechargement.
+      const fil = session?.backend ?? id;
+      if (!fil) return;
+      setPiecesPhase("envoi");
+      setPiecesProgress(94);
+      const retenues = await attacherPieces(
+        fil,
+        ajoutees.flatMap((p) =>
+          p.donnees ? [{ nom: p.nom, mime: p.mime, donnees: p.donnees }] : [],
+        ),
+      );
+      useDiscussions.getState().fixer(id, fil, session?.moteur ?? null);
+      const local = new Map(ajoutees.map((piece) => [
+        `${piece.nom}|${piece.mime}|${piece.tailleOctets ?? piece.ko * 1024}`,
+        piece,
+      ]));
+      const pretes: PieceUI[] = retenues.map((piece) => {
+        const avant = local.get(`${piece.nom}|${piece.mime}|${piece.size ?? piece.ko * 1000}`);
+        return {
+          ...piece,
+          etat: "ready",
+          apercu: avant?.apercu ?? (piece.mime.startsWith("image/") ? urlPiece(fil, piece.cle) : undefined),
+        };
+      });
+      const nouvelles = pretes.filter((piece) =>
+        !piece.message_id &&
+        local.has(`${piece.nom}|${piece.mime}|${piece.size ?? piece.ko * 1000}`),
+      );
+      piecesNouvellesRef.current = [...piecesNouvellesRef.current, ...nouvelles];
+      setPieces(pretes.filter((piece) => !piece.message_id));
+    } catch (e) {
+      const info = erreurReseau(e);
+      // On conserve l'affichage local pour permettre une nouvelle tentative,
+      // mais on expose toujours la cause : un échec réseau ne doit pas devenir
+      // une fausse pièce « mémorisée ».
+      setPieces((precedentes) =>
+        fusionnerPieces(
+          precedentes,
+          ajoutees.map((piece) => ({ ...piece, etat: "error" as const })),
+          refusees,
+        ),
+      );
+      setDocsErreur(info.message);
+    } finally {
+      setPiecesBusy(false);
+      setPiecesPhase("lecture");
+      setPiecesProgress(0);
+      if (pieceInputRef.current) pieceInputRef.current.value = "";
     }
-    setPieces((precedentes) => {
-      const deja = new Set(precedentes.map((p) => p.cle));
-      const fusion = [...precedentes, ...ajoutees.filter((p) => !deja.has(p.cle))];
-      if (fusion.length > PIECE_MAX) {
-        refusees.push(`maximum ${PIECE_MAX} pièces par message`);
-        return fusion.slice(0, PIECE_MAX);
-      }
-      return fusion;
-    });
-    if (refusees.length) setDocsErreur(refusees.join(" · "));
-    if (pieceInputRef.current) pieceInputRef.current.value = "";
+  }
+
+  /** Recharge l'inventaire des pièces du fil courant (après un rechargement de page,
+   *  les puces doivent réapparaître : le backend, lui, s'en souvient. */
+  useEffect(() => {
+    piecesNouvellesRef.current = [];
+    const sessionCourante = enChat
+      ? useDiscussions.getState().sessions.find((x) => x.id === activeId)
+      : sessionEditHistorique;
+    const fil = sessionCourante?.backend ?? null;
+    const modePieces = enChat ? "chat" : "edit";
+    if (!fil) {
+      if (!fil) setPieces([]);
+      return;
+    }
+    let annule = false;
+    void listerPieces(fil, modePieces)
+      .then((retenues) => {
+        if (annule) return;
+        const inventaire: PieceUI[] = retenues.map((piece) => ({
+          ...piece,
+          etat: "ready",
+          apercu: piece.mime.startsWith("image/") ? urlPiece(fil, piece.cle, modePieces) : undefined,
+        }));
+        setPieces(inventaire.filter((piece) => !piece.message_id));
+        if (sessionCourante) {
+          useDiscussions.getState().associerPiecesMessages(
+            sessionCourante.id,
+            inventaire.filter((piece) => piece.message_id).map(pieceVersMessage),
+          );
+        }
+      })
+      .catch(() => {
+        /* l'inventaire n'est pas critique : les pièces locales restent affichées */
+      });
+    return () => {
+      annule = true;
+    };
+  }, [activeId, activeEditId, enChat, sessionEditHistorique?.backend]);
+
+  async function oublierPiece(cle: string) {
+    const avant = pieces;
+    setPieces((p) => p.filter((x) => x.cle !== cle));
+    const nouvellesAvant = piecesNouvellesRef.current;
+    const fil = useDiscussions.getState().sessions.find((x) => x.id === activeId)?.backend ?? null;
+    if (!fil) {
+      piecesNouvellesRef.current = nouvellesAvant.filter((piece) => piece.cle !== cle);
+      return;
+    }
+    try {
+      setPieces(await retirerPiece(fil, cle));
+      piecesNouvellesRef.current = nouvellesAvant.filter((piece) => piece.cle !== cle);
+    } catch (e) {
+      setPieces(avant);
+      setDocsErreur(erreurReseau(e).message);
+    }
   }
 
   async function reindexerCours() {
@@ -488,22 +730,49 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     // photo et valide sans écrire. Sans consigne ni pièce, il n'y a rien à demander.
     const consigne = message.trim() || (pieces.length ? "Analyse la pièce jointe." : "");
     if (!consigne || busy) return;
-    const jointes: PieceJoine[] = pieces.map(({ nom, mime, donnees }) => ({ nom, mime, donnees }));
+    // Seules les pièces pas encore confiées au backend sont envoyées ici : celles
+    // qui le sont déjà sont réinjectées par lui à chaque requête, sans renvoi.
+    const enAttente: PieceJoine[] = pieces.flatMap((p) =>
+      p.donnees ? [{ nom: p.nom, mime: p.mime, donnees: p.donnees }] : [],
+    );
     abortRef.current?.abort();
     const ctrl = new AbortController();
     abortRef.current = ctrl;
     setBusy(true);
     setErreurChat(null);
     setMessage("");
-    setPieces([]);
 
     const disc = useDiscussions.getState();
     let id = activeId;
     if (!id) id = disc.nouvelle("chat");
-    disc.ajouterMessage(id, "user", consigne);
+    const sessionLocale = useDiscussions.getState().sessions.find((x) => x.id === id);
+    const backendAvant = sessionLocale?.backend ?? null;
+    const messageId = genererIdMessage();
+    const piecesMessage: PieceMessage[] = piecesNouvellesRef.current.map((piece) => ({
+      ...pieceVersMessage(piece),
+      previewUrl: piece.mime.startsWith("image/") && sessionLocale?.backend
+        ? urlPiece(sessionLocale.backend, piece.cle)
+        : piece.apercu,
+    }));
+    disc.ajouterMessage(id, "user", consigne, piecesMessage, messageId);
+    const clesEnvoyees = new Set(piecesMessage.map((piece) => piece.id));
+    setPieces((courantes) => courantes.filter((piece) => !clesEnvoyees.has(piece.cle)));
     disc.ajouterMessage(id, "assistant", "");
-    const backendAvant =
-      useDiscussions.getState().sessions.find((x) => x.id === id)?.backend ?? null;
+    // Les anciennes discussions sauvegardées avant l'existence de la session
+    // backend possèdent encore leur fil dans Zustand/localStorage. On le passe
+    // une seule fois pour que l'IA retrouve ce qui a déjà été dit.
+    const anciensMessages = sessionLocale?.messages.slice(0, -2) ?? [];
+    const historique = [] as Array<{ question: string; reponse: string }>;
+    for (let i = 0; i < anciensMessages.length; i += 2) {
+      const question = anciensMessages[i];
+      const reponse = anciensMessages[i + 1];
+      if (question?.role === "user" && question.texte.trim()) {
+        historique.push({
+          question: question.texte,
+          reponse: reponse?.role === "assistant" ? reponse.texte : "",
+        });
+      }
+    }
 
     try {
       for await (const evt of chatAgent(
@@ -514,12 +783,34 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           session: backendAvant,
           documents: contexteDocs,
           web: contexteWeb,
-          pieces: jointes,
+          pieces: enAttente,
+          messageId,
+          // Le backend ignore ce secours s'il possède déjà sa mémoire durable;
+          // l'envoyer aussi pour un fil connu permet de réparer une session dont
+          // le fichier aurait été supprimé ou déplacé entre deux lancements.
+          historique,
           signal: ctrl.signal,
         },
       )) {
         if (evt.event === "debut") {
           useDiscussions.getState().fixer(id, evt.data.session ?? id, evt.data.moteur);
+          // Les pièces locales viennent d'être stockées par le backend : on
+            // récupère son inventaire pour afficher ses clés définitives.
+          const fil = evt.data.session ?? id;
+          void listerPieces(fil)
+            .then((retenues) => {
+              const inventaire: PieceUI[] = retenues.map((piece) => ({
+                ...piece,
+                etat: "ready",
+                apercu: piece.mime.startsWith("image/") ? urlPiece(fil, piece.cle) : undefined,
+              }));
+              setPieces(inventaire.filter((piece) => !piece.message_id));
+              useDiscussions.getState().associerPiecesMessages(
+                id,
+                inventaire.filter((piece) => piece.message_id).map(pieceVersMessage),
+              );
+            })
+            .catch(() => undefined);
         } else if (evt.event === "texte") {
           useDiscussions.getState().fusionnerDelta(id, evt.data.delta);
         } else if (evt.event === "reprise") {
@@ -538,13 +829,13 @@ export function ChatPanel({ projet }: ChatPanelProps) {
           break;
         }
       }
+      // Les pièces ont été montrées avec ce message. Elles restent toutefois
+      // conservées côté backend pour les questions suivantes.
+      piecesNouvellesRef.current = [];
     } catch (e) {
       if (!ctrl.signal.aborted) {
         useDiscussions.getState().retirerAssistantVide(id);
-        setErreurChat({
-          code: "interne",
-          message: e instanceof Error ? e.message : String(e),
-        });
+        setErreurChat(erreurReseau(e));
       }
     } finally {
       setBusy(false);
@@ -557,7 +848,16 @@ export function ChatPanel({ projet }: ChatPanelProps) {
     if (!consigne.trim() || busy || !projet) return;
     const historique = useDiscussions.getState();
     const sessionId = activeEditId ?? historique.nouvelle("edit");
-    historique.ajouterMessage(sessionId, "user", consigne);
+    const messageId = genererIdMessage();
+    const piecesEdit: PieceMessage[] = pieces.map((piece) => ({
+      id: piece.cle,
+      filename: piece.nom,
+      mime_type: piece.mime,
+      size: piece.tailleOctets ?? piece.ko * 1024,
+      pages: piece.pages,
+      previewUrl: piece.apercu,
+    }));
+    historique.ajouterMessage(sessionId, "user", consigne, piecesEdit, messageId);
     setBusy(true);
     setTexte([]);
     setProps([]);
@@ -572,6 +872,10 @@ export function ChatPanel({ projet }: ChatPanelProps) {
       for await (const evt of chatAgent(projetEdit, consigne, {
         mode: "edit",
         session: sessionEdit,
+        messageId,
+        pieces: pieces.flatMap((piece) =>
+          piece.donnees ? [{ nom: piece.nom, mime: piece.mime, donnees: piece.donnees }] : [],
+        ),
         signal: controller.signal,
       })) {
         if (evt.event === "debut") {
@@ -879,6 +1183,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
                 message={m}
                 dernier={i === active!.messages.length - 1}
                 busy={busy}
+                session={active!.backend ?? active!.id}
               />
             ))}
             {busy && (
@@ -1015,6 +1320,59 @@ export function ChatPanel({ projet }: ChatPanelProps) {
       {enChat ? (
         <div className="chat-bar-chat">
           <div className="composer">
+            <div className="composer-interieur">
+            {pieces.length > 0 && (
+              <div className="composer-pieces">
+                {pieces.map((piece) => (
+                  <div className={"composer-piece" + (piece.mime.startsWith("image/") ? " is-image" : "")} key={piece.cle}>
+                    {piece.mime.startsWith("image/") ? (
+                      piece.apercu ? <img className="composer-piece-thumb" src={piece.apercu} alt="" /> : <span className="composer-piece-thumb-placeholder">▧</span>
+                    ) : (
+                      <span className="composer-piece-pdf">PDF</span>
+                    )}
+                    <span className="composer-piece-body">
+                      <span className="composer-piece-nom" title={`${piece.nom} · ${taillePiece(piece.ko)}`}>
+                        {piece.nom}
+                      </span>
+                      <span className={"composer-piece-status " + (piece.etat ?? "ready")}>
+                        {piece.etat === "uploading" ? "Uploading…" : piece.etat === "processing" ? "Processing…" : piece.etat === "error" ? "Erreur" : `✓ Ready${piece.pages ? ` · ${piece.pages} pages` : ""}`}
+                      </span>
+                    </span>
+                    <span className="composer-piece-taille">{taillePiece(piece.ko)}</span>
+                    <button
+                      className="composer-piece-retirer"
+                      onClick={() => void oublierPiece(piece.cle)}
+                      title="Ne plus joindre ce fichier. Les réponses déjà données restent dans la conversation."
+                      disabled={busy || piecesBusy}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                ))}
+                <span className="composer-piece-note">
+                  Gardées pour toute cette conversation : tu peux en reparler sans les re-joindre.
+                </span>
+              </div>
+            )}
+            {piecesBusy && (
+              <div className="composer-piece-loading" role="status" aria-live="polite">
+                <div className="composer-piece-loading-label">
+                  <span className="composer-piece-spinner" aria-hidden="true" />
+                  <span>
+                    {piecesPhase === "lecture"
+                      ? `Préparation des pièces jointes… ${piecesProgress}%`
+                      : "Ajout sécurisé au fil de discussion…"}
+                  </span>
+                </div>
+                <div className="composer-piece-progress" aria-hidden="true">
+                  <span
+                    className={piecesPhase === "envoi" ? "indeterminate" : ""}
+                    style={piecesPhase === "lecture" ? { width: `${piecesProgress}%` } : undefined}
+                  />
+                </div>
+              </div>
+            )}
+            <div className="composer-controls">
             <div className="composer-plus-wrap">
               <button
                 className="composer-plus"
@@ -1066,7 +1424,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
                     />
                     Recherche web (DuckDuckGo)
                   </label>
-                  <div className="composer-menu-sep">Pièce jointe au message</div>
+                  <div className="composer-menu-sep">Pièces jointes (mode Chat)</div>
                   <div className="composer-menu-actions">
                     <button
                       className="composer-mini"
@@ -1074,10 +1432,14 @@ export function ChatPanel({ projet }: ChatPanelProps) {
                         setMenuPlus(false);
                         pieceInputRef.current?.click();
                       }}
-                      disabled={busy || pieces.length >= PIECE_MAX}
-                      title="Image ou PDF envoyé avec le prochain message (mode Chat)"
+                      disabled={busy || piecesBusy || pieces.length >= PIECE_MAX}
+                      title="Image ou PDF gardé pour toute la conversation (mode Chat)"
                     >
-                      Image ou PDF…
+                      {piecesBusy
+                        ? piecesPhase === "lecture"
+                          ? `Lecture… ${piecesProgress}%`
+                          : "Ajout au chat…"
+                        : "Image ou PDF…"}
                     </button>
                   </div>
                   <div className="composer-menu-sep">Cours ({docs?.documents.length ?? 0})</div>
@@ -1114,7 +1476,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
               value={message}
               onChange={(e) => setMessage(e.target.value)}
               onKeyDown={(e) => {
-                if (e.key === "Enter" && !busy) envoyerActif();
+                if (e.key === "Enter" && !busy && !piecesBusy) envoyerActif();
               }}
               placeholder={pieces.length ? "Question (facultative si pièce jointe)…" : "Pose une question…"}
               disabled={busy}
@@ -1122,38 +1484,20 @@ export function ChatPanel({ projet }: ChatPanelProps) {
             <button
               className="composer-envoi"
               onClick={envoyerActif}
-              disabled={busy || (!message.trim() && !pieces.length)}
+              disabled={busy || piecesBusy || (!message.trim() && !pieces.length)}
             >
               {busy ? "…" : "Envoyer"}
             </button>
-          </div>
-          {pieces.length > 0 && (
-            <div className="composer-pieces">
-              {pieces.map((piece) => (
-                <span className="composer-piece" key={piece.cle}>
-                  <span className="composer-piece-nom" title={`${piece.nom} · ${piece.ko} Ko`}>
-                    {piece.nom}
-                  </span>
-                  <span className="composer-piece-taille">{piece.ko} Ko</span>
-                  <button
-                    className="composer-piece-retirer"
-                    onClick={() => setPieces((p) => p.filter((x) => x.cle !== piece.cle))}
-                    title="Retirer cette pièce jointe"
-                    disabled={busy}
-                  >
-                    ✕
-                  </button>
-                </span>
-              ))}
             </div>
-          )}
+            </div>
+          </div>
           <input
             ref={pieceInputRef}
             type="file"
             multiple
             accept=".png,.jpg,.jpeg,.jfif,.gif,.webp,.pdf,image/png,image/jpeg,image/gif,image/webp,application/pdf"
             hidden
-            onChange={(e) => void choisirPieces(e.target.files)}
+            onChange={(e) => void attacher(e.target.files)}
           />
           <div className="chat-note">
             L'assistant répond sans jamais modifier tes fichiers
@@ -1217,9 +1561,7 @@ export function ChatPanel({ projet }: ChatPanelProps) {
               ? "Roch écrit dans le projet courant. Utilise un dépôt Git pour pouvoir annuler ses changements."
               : "L'agent propose des modifications — rien n'est écrit tant que tu n'as pas validé et appliqué."}
           </div>
-          {erreurDossier && (
-            <div className="chat-erreur">{erreurDossier}</div>
-          )}
+          {erreurDossier && <div className="chat-erreur">{erreurDossier}</div>}
         </div>
       )}
     </div>

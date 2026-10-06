@@ -186,6 +186,7 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 AI_TIMEOUT_MS = int(os.getenv("AI_TIMEOUT_MS", "20000"))
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+GROQ_VISION_MODEL = os.getenv("GROQ_VISION_MODEL", "qwen/qwen3.8-27b")
 
 # Budgets du contexte envoyé à l'agent (anti-explosion de tokens).
 # Calibrés pour rester SOUS la limite la plus basse des moteurs de repli

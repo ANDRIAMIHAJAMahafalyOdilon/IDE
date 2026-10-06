@@ -84,6 +84,10 @@ def test_le_plugin_ne_reagit_qu_aux_commandes_longues():
     # serveurs partir en arrière-plan — l'inverse de ce qu'il veut.
     assert "AISTUDIO_AGENT" in js
     assert "AISTUDIO_FOND" in js
+    assert "Buffer.from" in js
+    assert "lancer_arriere_plan\\.cmd" in js
+    assert "CommandeBase64" in af._LANCEUR
+    assert "FromBase64String" in af._DETACHEUR
 
 
 def test_le_plugin_embarque_tous_les_motifs():

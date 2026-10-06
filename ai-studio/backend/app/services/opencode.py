@@ -25,6 +25,7 @@ from ..config import (
     OPENCODE_AGENT_BASE_URL,
     OPENCODE_BASE_URL,
     OPENCODE_CONFIG,
+    OPENCODE_MODEL,
     OPENCODE_TIMEOUT,
 )
 
@@ -351,6 +352,25 @@ def _tourne_avec_notre_config(base: str) -> bool:
     return all(nom in agents for nom in (CHAT_AGENT, EDIT_AGENT))
 
 
+def _configuration_agent_a_jour(base: str) -> bool:
+    """Vrai si le serveur Edit porte la configuration actuellement attendue.
+
+    Un serveur OpenCode conserve sa configuration en mémoire. Vérifier seulement
+    sa santé et ses agents ne suffit donc pas : un ancien processus pouvait
+    continuer à utiliser `space-bunny-free` après le passage à `big-pickle`.
+    """
+    config = _config_du_serveur(base)
+    if config is None or not _tourne_avec_notre_config(base):
+        return False
+    if OPENCODE_MODEL and config.get("model") != OPENCODE_MODEL:
+        return False
+    instructions = config.get("instructions")
+    return isinstance(instructions, list) and any(
+        "Contrat prioritaire du mode Edit autonome" in str(item)
+        for item in instructions
+    )
+
+
 def _renouveler_serveur(base: str) -> bool:
     """Force le serveur de `base` à recharger la configuration d'AI Studio.
 
@@ -496,7 +516,15 @@ def assurer_serveur_agent(directory: str | Path) -> None:
     """
     global _SERVEUR_AGENT_PROCESS
     if verifier_serveur_agent():
-        return
+        if _configuration_agent_a_jour(OPENCODE_AGENT_BASE_URL):
+            return
+        # Le processus est bien le nôtre mais sert une ancienne config : le
+        # renouvellement est borné par `_est_opencode` et ne touche jamais un
+        # autre programme qui occuperait le port.
+        if not _renouveler_serveur(OPENCODE_AGENT_BASE_URL):
+            # Port occupé par un OpenCode externe : ne pas le tuer et ne pas
+            # lancer un second serveur en concurrence.
+            return
     _VETEE.discard(OPENCODE_AGENT_BASE_URL)
     if _SERVEUR_AGENT_PROCESS is not None and _SERVEUR_AGENT_PROCESS.poll() is not None:
         _SERVEUR_AGENT_PROCESS = None

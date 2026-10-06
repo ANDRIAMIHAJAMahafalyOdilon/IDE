@@ -9,6 +9,7 @@ optionnel et en LECTURE SEULE. D'où l'absence totale de dépendance à
 from __future__ import annotations
 
 import logging
+import time
 from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -223,6 +224,24 @@ def _premier_delta(flux: Iterator[str]) -> str | None:
     return None
 
 
+def _prompt_secours(prompt: str, maximum: int = 6000) -> str:
+    """Version courte de secours si un fournisseur refuse la taille du contexte.
+
+    Garde le début (consignes) et la fin (pièces jointes récentes et question),
+    qui sont les parties les plus utiles. Cette version n'est utilisée qu'après
+    une erreur explicite de capacité de contexte.
+    """
+    if len(prompt) <= maximum:
+        return prompt
+    debut = min(1800, maximum // 3)
+    fin = maximum - debut - len("\n[…contexte réduit pour respecter la limite…]\n")
+    return (
+        prompt[:debut]
+        + "\n[…contexte réduit pour respecter la limite…]\n"
+        + prompt[-fin:]
+    )
+
+
 MoteurFlux = Callable[[str], Iterator[str]]
 
 
@@ -249,7 +268,9 @@ def _tronconner(texte: str, taille: int = 80) -> Iterator[str]:
         reste = reste[coupe + 1 :]
 
 
-def _flux_opencode(prompt: str, images: list[dict[str, str]] | None = None) -> Iterator[str]:
+def _flux_opencode(
+    prompt: str, images: list[dict[str, str]] | None = None
+) -> Iterator[str]:
     """Réponse du moteur OpenCode, découpée pour l'affichage progressif.
 
     `repondre_chat` rend la réponse complète (l'endpoint message ne streame pas).
@@ -258,14 +279,20 @@ def _flux_opencode(prompt: str, images: list[dict[str, str]] | None = None) -> I
     `ErreurOpenCode` est traduite en `ErreurMoteur` : sans cela, la bascule vers
     les moteurs suivants de `stream_reponse` ne se ferait pas.
 
-    `images` : parties `file` jointes au message. Seul OpenCode les reçoit — les
-    moteurs de secours sont des API texte et ne sauraient pas quoi en faire.
+    Les images sont envoyées comme parties `file`. Les PDF restent dans le prompt
+    sous forme de texte extrait, car le client OpenCode ne reçoit pas le binaire PDF.
     """
     try:
-        if images:
-            texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt, images=images)
+        parties_image = [
+            partie
+            for partie in images or []
+            if str(partie.get("mime") or "").startswith("image/")
+        ]
+        if parties_image:
+            texte = opencode.repondre_chat(
+                OPENCODE_CHAT_DIR, prompt, images=parties_image
+            )
         else:
-            # Sans pièce jointe, l'appel reste exactement celui d'avant.
             texte = opencode.repondre_chat(OPENCODE_CHAT_DIR, prompt)
     except opencode.ErreurOpenCode as exc:
         raise moteurs.ErreurMoteur("moteur_indisponible", f"opencode : {exc.message}") from exc
@@ -282,29 +309,28 @@ def _engins(images: list[dict[str, str]] | None = None) -> list[tuple[str, Moteu
     substitution de `moteurs.gemini_flux` (tests, bascule de moteur) serait
     silencieusement ignorée.
 
-    OpenCode est EN TÊTE, toujours, sans condition de clé.
-
-    L'utilisateur attend « je réponds avec le moteur embarqué, gratuitement ».
-    La présence d'une clé Gemini dans le .env ne doit pas suffire à détourner la
-    conversation vers un service distant payant ou quota-limité : cette clé sert
-    à la recherche web et à l'indexation des documents, pas à choisir le moteur
-    d'une simple réponse.
-
-    Gemini et Groq restent en SECOURS — ce qu'ils étaient avant que le moteur
-    embarqué existe. Ils ne sont tentés que si OpenCode échoue, ce qui laisse la
-    bascule intacte sans jamais en faire le choix par défaut.
-
-Les images jointes sont liées au SEUL moteur OpenCode via `partial` : la
-    signature `MoteurFlux(prompt)` reste donc valide pour les moteurs de secours,
-    qui reçoivent le prompt (texte des PDF compris) et rien de plus. Sans pièce
-    jointe, `_flux_opencode` est passé tel quel — l'appel reste strictement
-    identique à celui d'avant les pièces jointes.
+    Sans pièce jointe, le Chat garde sa chaîne habituelle Groq -> Gemini ->
+    OpenCode. Avec une pièce, OpenCode reste le dernier recours : les images lui
+    sont transmises comme médias et le texte extrait des PDF reste dans le prompt.
     """
-    return [
-        ("opencode", _flux_opencode if not images else partial(_flux_opencode, images=images)),
-        ("gemini", moteurs.gemini_flux),
-        ("groq", moteurs.groq_flux),
-    ]
+    opencode = _flux_opencode
+    if not images:
+        return [("groq", moteurs.groq_flux), ("gemini", moteurs.gemini_flux), ("opencode", opencode)]
+
+    groq = partial(moteurs.groq_flux, pieces=images)
+    gemini = partial(moteurs.gemini_flux, pieces=images)
+
+    # Gemini comprend les deux formats ; Groq comprend les images et reçoit le
+    # texte extrait des PDF. OpenCode ferme la chaîne de secours. Il reçoit les
+    # images comme parties `file`; les PDF sont déjà représentés dans le prompt
+    # par leur texte extrait.
+    a_un_pdf = any(piece.get("mime") == "application/pdf" for piece in images)
+    opencode_avec_pieces = partial(_flux_opencode, images=images)
+    moteurs_avec_pieces = [("gemini", gemini), ("groq", groq)]
+    if a_un_pdf:
+        moteurs_avec_pieces.append(("opencode", opencode_avec_pieces))
+        return moteurs_avec_pieces
+    return [("groq", groq), ("gemini", gemini), ("opencode", opencode_avec_pieces)]
 
 
 def stream_reponse(
@@ -332,22 +358,51 @@ def stream_reponse(
     """
     erreurs: list[str] = []
     engins = _engins(images)
+    prompt_reduit = _prompt_secours(prompt)
+    prompt_courant = prompt
     i = 0
     annonce = False
+    reprises_quota: set[str] = set()
     while i < len(engins):
         nom, flux_fn = engins[i]
         # ── Sélection du moteur : jusqu'au premier token inclus ──────────────
         try:
-            flux = flux_fn(prompt)
+            flux = flux_fn(prompt_courant)
             premier = _premier_delta(flux)
         except moteurs.ErreurMoteur as exc:
+            # Un 429 temporaire peut inclure le délai de réinitialisation du
+            # quota dans les en-têtes. On retente une seule fois, uniquement
+            # pour un délai court, avant de basculer vers le moteur suivant.
+            if (
+                exc.code == "quota"
+                and nom not in reprises_quota
+                and exc.retry_after is not None
+                and 0 < exc.retry_after <= 8
+            ):
+                reprises_quota.add(nom)
+                attente = exc.retry_after
+                logger.warning(
+                    "reprise_quota moteur=%s delai_s=%.2f tentative=1",
+                    nom,
+                    attente,
+                )
+                time.sleep(attente + 0.2)
+                continue
             erreurs.append(f"{exc.code} ({nom}) : {exc.message}")
             logger.error(
                 "moteur_refuse moteur=%s code=%s avant_premier_chunk=oui",
                 nom,
                 exc.code,
             )
+            if exc.code == "contexte_trop_long" and prompt_courant != prompt_reduit:
+                logger.warning("reduction_contexte moteur=%s avant_premier_chunk=oui", nom)
+                prompt_courant = prompt_reduit
+                continue
             i += 1
+            if exc.code == "contexte_trop_long":
+                prompt_courant = prompt_reduit
+            elif i < len(engins):
+                prompt_courant = prompt
             continue
         if premier is None:
             erreurs.append(f"{nom} : réponse vide.")
@@ -369,6 +424,10 @@ def stream_reponse(
         except moteurs.ErreurMoteur as exc:
             erreurs.append(f"{exc.code} ({nom}) : {exc.message}")
             i += 1
+            if exc.code == "contexte_trop_long":
+                prompt_courant = prompt_reduit
+            elif i < len(engins):
+                prompt_courant = prompt
             reste = engins[i:]
             if reste:
                 # WARNING et non INFO : visible dans uvicorn.log sans

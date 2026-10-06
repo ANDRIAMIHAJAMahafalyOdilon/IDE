@@ -378,6 +378,42 @@ def mapper_ligne(
 
 # ────────────────────────── Exécution réelle (générateur) ──────────────────
 
+def construire_consigne_tache(racine: Path, message: str) -> str:
+    """Ajoute au tour autonome un contrat court et non ambigu.
+
+    Le contrat est répété dans le message utilisateur : il protège aussi les
+    reprises de session et le chemin CLI de secours. Les chemins cités dans des
+    logs ne doivent jamais prendre le pas sur *racine*, qui est le périmètre
+    réel de la tâche.
+    """
+    dossier = str(racine.resolve())
+    demande = message.strip()
+    return f"""[CONTRAT D'EXECUTION AI STUDIO]
+Dossier de travail autorisé et unique : {dossier}
+
+Réalise uniquement la demande entre les balises ci-dessous. Tout chemin
+extérieur au dossier autorisé, même s'il apparaît dans un ancien log ou dans
+la conversation, est une information périmée et doit être ignorée.
+
+Règles de proportion :
+- demande simple (lancer, vérifier, arrêter, ouvrir) : une inspection ciblée
+  au maximum, une action, une vérification unique, puis arrêt ;
+- fais seulement le composant demandé ; ne démarre pas tout le projet par
+  défaut ;
+- pour un serveur long, utilise le script officiel du projet si présent ;
+  sinon lance la commande brute et laisse AI Studio la détacher ;
+- ne fabrique pas de Start-Process, cmd /c, redirection de log ou appel au
+  lanceur AI Studio : le système d'exécution s'en charge ;
+- ne reste jamais à attendre un serveur de développement et ne répète pas une
+  action déjà réussie ;
+- pour une modification ou un débogage, lis uniquement les fichiers concernés,
+  modifie-les, puis vérifie avec un test ciblé ;
+- arrête-toi dès que l'objectif est atteint et résume en une phrase.
+
+<demande_utilisateur>
+{demande}
+</demande_utilisateur>"""
+
 def _commande(binaire: str, racine: Path, message: str, sid: str | None) -> list[str]:
     cmd = [
         binaire,
@@ -1013,8 +1049,12 @@ async def executer_tache(
     if not message.strip():
         raise ErreurTache("schema_invalide", "Consigne vide.")
 
+    # Le contrat est injecté avant les deux moteurs pour que le comportement
+    # soit identique sur le serveur dédié et sur le chemin CLI de secours.
+    consigne = construire_consigne_tache(racine, message)
+
     if moteur == "serveur" and processus is None:
-        async for item in executer_tache_serveur(racine, message, sid_opencode, timeout):
+        async for item in executer_tache_serveur(racine, consigne, sid_opencode, timeout):
             yield item
         return
 
@@ -1024,7 +1064,7 @@ async def executer_tache(
         except ErreurTache:
             raise
         try:
-            processus = _demarrer(bin_, racine, message, sid_opencode)
+            processus = _demarrer(bin_, racine, consigne, sid_opencode)
         except OSError as exc:
             raise ErreurTache("moteur_indisponible", f"Impossible de lancer l'agent : {exc}") from exc
 

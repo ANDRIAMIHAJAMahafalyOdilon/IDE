@@ -532,6 +532,15 @@ def test_commande_reprend_session_sans_fork():
     assert cmd[-1] == "consigne"
 
 
+def test_consigne_autonome_borne_le_dossier_et_proportionne_l_action():
+    racine = pathlib.Path("C:/Users/Roch/mon-projet")
+    consigne = at.construire_consigne_tache(racine, "lance le backend")
+    assert "C:\\Users\\Roch\\mon-projet" in consigne
+    assert "chemin périmé" not in consigne
+    assert "ne fabrique pas de Start-Process" in consigne
+    assert "<demande_utilisateur>\nlance le backend" in consigne
+
+
 def test_tache_sans_processus_demarre_la_cli_et_non_le_serveur():
     """En mode `cli`, sans processus injecté, c'est bien la CLI qui démarre.
 
@@ -567,7 +576,8 @@ def test_tache_sans_processus_demarre_la_cli_et_non_le_serveur():
 
     assert appels["binaire"] == "opencode.exe"
     assert appels["nombre"] == 1
-    assert appels["message"] == "teste la CLI"
+    assert "<demande_utilisateur>\nteste la CLI" in appels["message"]
+    assert "Dossier de travail autorisé et unique" in appels["message"]
     assert [nom for nom, _ in evts] == ["debut", "texte", "fin"]
 
 

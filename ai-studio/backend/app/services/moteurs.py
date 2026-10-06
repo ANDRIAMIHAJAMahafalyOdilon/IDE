@@ -16,10 +16,19 @@ d'inactivité. À RETIRER une fois le comportement des moteurs validé.
 from __future__ import annotations
 
 import logging
+import base64
+import re
 import time
-from typing import Iterator
+from typing import Any, Iterator
 
-from ..config import AI_TIMEOUT_MS, GEMINI_API_KEY, GEMINI_MODEL, GROQ_API_KEY, GROQ_MODEL
+from ..config import (
+    AI_TIMEOUT_MS,
+    GEMINI_API_KEY,
+    GEMINI_MODEL,
+    GROQ_API_KEY,
+    GROQ_MODEL,
+    GROQ_VISION_MODEL,
+)
 
 logger = logging.getLogger("ai_studio.moteurs")
 
@@ -89,10 +98,28 @@ class _TraceFlux:
 class ErreurMoteur(Exception):
     """Erreur d'un moteur LLM, avec code normalisé pour l'événement `erreur`."""
 
-    def __init__(self, code: str, message: str):
+    def __init__(self, code: str, message: str, retry_after: float | None = None):
         super().__init__(message)
         self.code = code
         self.message = message
+        self.retry_after = retry_after
+
+
+def _delai_retry(exc: Exception) -> float | None:
+    """Lit un Retry-After ou le reset TPM des en-têtes du fournisseur."""
+    response = getattr(exc, "response", None)
+    headers = getattr(response, "headers", {}) or {}
+    for nom in ("retry-after", "x-ratelimit-reset-tokens"):
+        valeur = str(headers.get(nom) or "").strip()
+        if not valeur:
+            continue
+        try:
+            return max(0.0, float(valeur))
+        except ValueError:
+            match = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*s", valeur, re.IGNORECASE)
+            if match:
+                return float(match.group(1))
+    return None
 
 
 def _classer(exc: Exception, moteur: str) -> ErreurMoteur:
@@ -111,21 +138,47 @@ def _classer(exc: Exception, moteur: str) -> ErreurMoteur:
         statut = None
     if statut in (401, 403) or "api key" in texte or "unauthorized" in texte:
         return ErreurMoteur("auth", f"{moteur} : clé API invalide ou non autorisée.")
+    # Les statuts HTTP sont prioritaires sur le corps du fournisseur : les
+    # erreurs 429 et 413 ont une signification sans ambiguïté.
+    if statut == 429:
+        return ErreurMoteur(
+            "quota", f"{moteur} : quota ou débit par minute dépassé.", _delai_retry(exc)
+        )
+    if statut == 413:
+        return ErreurMoteur(
+            "requete_trop_volumineuse",
+            f"{moteur} : le corps de la requête dépasse la taille maximale acceptée.",
+        )
     if (
-        statut in (429, 413)
-        or "429" in texte
+        "429" in texte
         or "quota" in texte
         or "rate limit" in texte
-        or "request too large" in texte
-        or "too large" in texte
+        or "tokens per minute" in texte
+        or re.search(r"\btpm\b", texte)
     ):
-        if statut == 413 or "too large" in texte:
-            return ErreurMoteur(
-                "quota",
-                f"{moteur} : le contexte depasse la limite de tokens du modele "
-                "(TPM) ; le prompt a ete reduit, reessayez.",
-            )
-        return ErreurMoteur("quota", f"{moteur} : quota dépassé ou débit limité.")
+        return ErreurMoteur(
+            "quota", f"{moteur} : quota ou débit par minute dépassé.", _delai_retry(exc)
+        )
+    if (
+        "request too large" in texte
+        or "request entity too large" in texte
+        or "request body too large" in texte
+        or "payload too large" in texte
+    ):
+        return ErreurMoteur(
+            "requete_trop_volumineuse",
+            f"{moteur} : le corps de la requête dépasse la taille maximale acceptée.",
+        )
+    if (
+        "context length" in texte
+        or "context window" in texte
+        or "too many tokens" in texte
+        or "prompt is too long" in texte
+    ):
+        return ErreurMoteur(
+            "contexte_trop_long",
+            f"{moteur} : le prompt dépasse la capacité de contexte du modèle.",
+        )
     if statut in (408, 504) or "timeout" in texte or "timed out" in texte:
         return ErreurMoteur("timeout", f"{moteur} : délai dépassé.")
     return ErreurMoteur(
@@ -133,8 +186,46 @@ def _classer(exc: Exception, moteur: str) -> ErreurMoteur:
     )
 
 
-def gemini_generer(chaine: str) -> str:
-    """Appelle Gemini (texte seul). Lève ErreurMoteur."""
+def _octets_partie(partie: dict[str, str]) -> bytes:
+    """Décode une partie `file` produite par services.pieces_jointe."""
+    url = str(partie.get("url") or "")
+    donnees = url.split(",", 1)[1] if url.startswith("data:") and "," in url else url
+    return base64.b64decode(donnees, validate=True)
+
+
+def _contenu_groq(chaine: str, pieces: list[dict[str, str]] | None) -> tuple[Any, bool]:
+    """Construit le format OpenAI-compatible attendu par Groq Vision.
+
+    Groq Vision accepte les images via `image_url`. Les PDF restent représentés
+    par leur texte extrait dans `chaine` : Gemini/OpenCode reçoivent en plus le
+    fichier PDF natif.
+    """
+    images = [p for p in (pieces or []) if str(p.get("mime") or "").startswith("image/")]
+    if not images:
+        return chaine, False
+    contenu: list[dict[str, Any]] = [{"type": "text", "text": chaine}]
+    for partie in images[:3]:  # plafond officiel du modèle vision Groq
+        contenu.append(
+            {
+                "type": "image_url",
+                "image_url": {"url": partie["url"]},
+            }
+        )
+    return contenu, True
+
+
+def _contenus_gemini(chaine: str, pieces: list[dict[str, str]] | None, types: Any) -> list[Any]:
+    """Construit un contenu Gemini mêlant texte, images et PDF natifs."""
+    contenus: list[Any] = [{"text": chaine}]
+    for partie in pieces or []:
+        mime = str(partie.get("mime") or "")
+        if mime.startswith("image/") or mime == "application/pdf":
+            contenus.append(types.Part.from_bytes(data=_octets_partie(partie), mime_type=mime))
+    return contenus
+
+
+def gemini_generer(chaine: str, pieces: list[dict[str, str]] | None = None) -> str:
+    """Appelle Gemini avec texte, images et PDF éventuels."""
     if not GEMINI_API_KEY:
         raise ErreurMoteur("auth", "gemini : GEMINI_API_KEY absente du .env.")
     try:
@@ -147,7 +238,7 @@ def gemini_generer(chaine: str) -> str:
     trace = _TraceFlux("gemini")
     try:
         reponse = client.models.generate_content(
-            model=GEMINI_MODEL, contents=[{"text": chaine}]
+            model=GEMINI_MODEL, contents=_contenus_gemini(chaine, pieces, types)
         )
         trace.chunk()
         return (reponse.text or "").strip()
@@ -158,8 +249,8 @@ def gemini_generer(chaine: str) -> str:
         trace.reussite()
 
 
-def groq_generer(chaine: str) -> str:
-    """Appelle Groq (texte seul). Lève ErreurMoteur."""
+def groq_generer(chaine: str, pieces: list[dict[str, str]] | None = None) -> str:
+    """Appelle Groq avec texte et images éventuelles."""
     if not GROQ_API_KEY:
         raise ErreurMoteur("auth", "groq : GROQ_API_KEY absente du .env.")
     try:
@@ -171,8 +262,10 @@ def groq_generer(chaine: str) -> str:
     client = Groq(api_key=GROQ_API_KEY, timeout=AI_TIMEOUT_MS / 1000, max_retries=0)
     trace = _TraceFlux("groq")
     try:
+        contenu, vision = _contenu_groq(chaine, pieces)
         completion = client.chat.completions.create(
-            model=GROQ_MODEL, messages=[{"role": "user", "content": chaine}]
+            model=GROQ_VISION_MODEL if vision else GROQ_MODEL,
+            messages=[{"role": "user", "content": contenu}],
         )
         trace.chunk()
         return (completion.choices[0].message.content or "").strip()
@@ -188,8 +281,8 @@ def groq_generer(chaine: str) -> str:
 # ErreurMoteur peut donc remonter avant tout token (auth/quota/indispo) ou en
 # cours de flux (coupure réseau) — l'appelant décide de la bascule.
 
-def gemini_flux(chaine: str) -> Iterator[str]:
-    """Streame la réponse Gemini (texte seul). Lève ErreurMoteur."""
+def gemini_flux(chaine: str, pieces: list[dict[str, str]] | None = None) -> Iterator[str]:
+    """Streame Gemini avec texte, images et PDF éventuels."""
     if not GEMINI_API_KEY:
         raise ErreurMoteur("auth", "gemini : GEMINI_API_KEY absente du .env.")
     try:
@@ -202,7 +295,7 @@ def gemini_flux(chaine: str) -> Iterator[str]:
     trace = _TraceFlux("gemini")
     try:
         flux = client.models.generate_content_stream(
-            model=GEMINI_MODEL, contents=[{"text": chaine}]
+            model=GEMINI_MODEL, contents=_contenus_gemini(chaine, pieces, types)
         )
         for bloc in flux:
             texte = bloc.text or ""
@@ -215,8 +308,8 @@ def gemini_flux(chaine: str) -> Iterator[str]:
     trace.reussite()
 
 
-def groq_flux(chaine: str) -> Iterator[str]:
-    """Streame la réponse Groq (texte seul). Lève ErreurMoteur."""
+def groq_flux(chaine: str, pieces: list[dict[str, str]] | None = None) -> Iterator[str]:
+    """Streame Groq avec texte et images éventuelles."""
     if not GROQ_API_KEY:
         raise ErreurMoteur("auth", "groq : GROQ_API_KEY absente du .env.")
     try:
@@ -228,9 +321,10 @@ def groq_flux(chaine: str) -> Iterator[str]:
     client = Groq(api_key=GROQ_API_KEY, timeout=AI_TIMEOUT_MS / 1000, max_retries=0)
     trace = _TraceFlux("groq")
     try:
+        contenu, vision = _contenu_groq(chaine, pieces)
         flux = client.chat.completions.create(
-            model=GROQ_MODEL,
-            messages=[{"role": "user", "content": chaine}],
+            model=GROQ_VISION_MODEL if vision else GROQ_MODEL,
+            messages=[{"role": "user", "content": contenu}],
             stream=True,
         )
         for chunk in flux:

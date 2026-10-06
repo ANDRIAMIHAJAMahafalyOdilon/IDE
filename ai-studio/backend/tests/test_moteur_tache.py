@@ -13,6 +13,7 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))  # backend/
 
 from app.services import agent_tache as at  # noqa: E402
+from app.services import opencode as oc  # noqa: E402
 
 
 def _racine() -> pathlib.Path:
@@ -55,11 +56,22 @@ def test_le_serveur_dedie_est_bien_appele():
 
     appels: list[str] = []
     ancien = oc.assurer_serveur_agent
+    ancienne_session = oc.creer_session
+    ancien_flux = oc.flux_tache
 
     def faux(racine):
         appels.append("agent")
 
+    def fausse_session(racine, titre, agent=False):
+        return "session-test"
+
+    async def faux_flux(racine, sid, message, agent=False, timeout=0):
+        if False:
+            yield None
+
     oc.assurer_serveur_agent = faux
+    oc.creer_session = fausse_session
+    oc.flux_tache = faux_flux
     try:
         async def collect():
             return [
@@ -72,7 +84,22 @@ def test_le_serveur_dedie_est_bien_appele():
         pass
     finally:
         oc.assurer_serveur_agent = ancien
+        oc.creer_session = ancienne_session
+        oc.flux_tache = ancien_flux
     assert appels == ["agent"], f"assurer_serveur_agent non appele : {appels}"
+
+
+def test_configuration_agent_obsolete_si_modele_ou_contrat_ancien():
+    ancien = oc._config_du_serveur
+    oc._config_du_serveur = lambda base: {
+        "model": "opencode/space-bunny-free",
+        "instructions": ["ancienne instruction"],
+        "agent": {"discussion": {}, "proposition": {}},
+    }
+    try:
+        assert not oc._configuration_agent_a_jour("http://127.0.0.1:4097")
+    finally:
+        oc._config_du_serveur = ancien
 
 
 if __name__ == "__main__":

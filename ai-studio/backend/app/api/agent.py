@@ -19,9 +19,17 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import FileResponse
 from sse_starlette.sse import EventSourceResponse
 
-from ..models.chat import RequeteApply, RequeteChat, RequetePermission, RequeteTache, RequeteTacheControle
+from ..models.chat import (
+    RequeteApply,
+    RequeteChat,
+    RequetePermission,
+    RequetePieces,
+    RequeteTache,
+    RequeteTacheControle,
+)
 from ..services import (
     agent_adapter, agent_chat, agent_discussion, agent_tache, application, moteurs,
     opencode, pieces_jointe, workspace,
@@ -203,6 +211,58 @@ async def chat(req: RequeteChat) -> EventSourceResponse:
     return EventSourceResponse(generer_evenements(req, racine))
 
 
+@router.post("/chat/pieces")
+async def chat_pieces(req: RequetePieces) -> dict[str, Any]:
+    """Attache des pièces au fil et renvoie ce qu'il retient désormais.
+
+    séparé de POST /chat parce que l'insertion précède l'envoi : c'est le seul
+    moyen de garantir qu'un PDF reste disponible pour les questions suivantes.
+    """
+    session = _session_id("chat", req.session)
+    try:
+        retenues = pieces_jointe.ajouter(session, req.pieces)
+    except pieces_jointe.ErreurPiece as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"session": session, "pieces": pieces_jointe.resume(retenues)}
+
+
+@router.get("/chat/pieces/fichier")
+async def chat_piece_fichier(session: str, cle: str, mode: str = "chat") -> FileResponse:
+    """Servit une preview sans exposer le chemin interne du stockage.
+
+    La résolution passe par le manifeste du fil : modifier `session` ou `cle`
+    ne permet donc pas de parcourir le disque ni d'obtenir une pièce d'un autre
+    fil.
+    """
+    if mode not in {"chat", "edit"}:
+        raise HTTPException(status_code=422, detail="Mode de conversation invalide.")
+    try:
+        chemin, mime, nom = pieces_jointe.fichier(session, cle, mode=mode)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="Pièce jointe introuvable.") from exc
+    return FileResponse(chemin, media_type=mime, filename=nom)
+
+
+@router.get("/chat/pieces")
+async def chat_pieces_liste(session: str, mode: str = "chat") -> dict[str, Any]:
+    """Pièces retenues par un fil, pour réafficher les puces après un rechargement."""
+    if mode not in {"chat", "edit"}:
+        raise HTTPException(status_code=422, detail="Mode de conversation invalide.")
+    return {
+        "session": session,
+        "pieces": pieces_jointe.liste(session, mode=mode),
+    }
+
+
+@router.delete("/chat/pieces")
+async def chat_pieces_retrait(session: str, cle: str, mode: str = "chat") -> dict[str, Any]:
+    """Oublie une pièce : les requêtes suivantes ne la recevront plus."""
+    if mode not in {"chat", "edit"}:
+        raise HTTPException(status_code=422, detail="Mode de conversation invalide.")
+    retenues = pieces_jointe.retirer(session, cle, mode=mode)
+    return {"session": session, "pieces": pieces_jointe.resume(retenues)}
+
+
 def _contexte_discussion(req: RequeteChat) -> tuple[str, str]:
     """Contexte projet en LECTURE SEULE, seulement s'il est disponible.
 
@@ -231,11 +291,29 @@ async def generer_discussion(req: RequeteChat) -> Any:
     """
     session = _session_id("chat", req.session)
     memoire = _memoire("chat", session)
+    if not memoire and req.historique_client:
+        # Migration douce des anciennes discussions : l'interface peut avoir
+        # conservé le fil dans localStorage alors que le backend ne connaissait
+        # pas encore son identifiant. On n'écrase jamais une mémoire déjà
+        # persistée, afin d'éviter les doublons après un simple rechargement.
+        memoire.extend(
+            {
+                "question": str(echange.get("question") or "").strip(),
+                "reponse": str(echange.get("reponse") or "").strip(),
+            }
+            for echange in req.historique_client
+            if isinstance(echange, dict) and str(echange.get("question") or "").strip()
+        )
+        del memoire[:-20]
     try:
-        # Les pièces jointes sont validées AVANT toute construction de prompt :
-        # une image trop lourde ou un PDF illisible doit s'arrêter ici, avec un
-        # message nommé, plutôt qu'au milieu d'un flux déjà commencé.
-        bloc_pieces, images = pieces_jointe.analyser(req.pieces if req.mode == "chat" else [])
+        # Les pièces jointes sont validées ET conservées AVANT toute construction de
+        # prompt : une image trop lourde ou un PDF illisible doit s'arrêter ici, avec
+        # un message nommé, plutôt qu'au milieu d'un flux déjà commencé. Elles sont
+        # ensuite réinjectées à CHAQUE requête du fil, pas seulement à celle-ci.
+        if req.mode == "chat" and (req.pieces or req.message_id):
+            pieces_jointe.ajouter(session, req.pieces, message_id=req.message_id)
+        bloc_pieces, images = pieces_jointe.etat(session, req.message)
+        images = pieces_jointe.optimiser_images_pour_modeles(images)
         arborescence, bloc = _contexte_discussion(req)
         if req.documents:
             bloc_documents = agent_discussion.construire_bloc_documents(req.message)
@@ -316,6 +394,17 @@ async def generer_evenements(req: RequeteChat, racine: Path) -> Any:
     asyncio.run (sans HTTP), mais branchée telle quelle sur le SSE réel."""
     session = _session_id("edit", req.session)
     try:
+        bloc_pieces = ""
+        if req.pieces:
+            pieces_jointe.ajouter(
+                session,
+                req.pieces,
+                mode="edit",
+                message_id=req.message_id,
+            )
+        images_pieces: list[dict[str, str]] = []
+        if req.pieces or pieces_jointe.liste(session, mode="edit"):
+            bloc_pieces, images_pieces = pieces_jointe.etat(session, req.message, mode="edit")
         if req.simulation:
             yield _evt("debut", {
                 "session": session, "autoris": req.autoriser_modifications,
@@ -359,6 +448,8 @@ async def generer_evenements(req: RequeteChat, racine: Path) -> Any:
             req.fichiers_contexte,
             _memoire("edit", session),
             sid,
+            bloc_pieces=bloc_pieces,
+            pieces=images_pieces,
         )
         if resultat["texte_resume"]:
             yield _evt("texte", {"delta": resultat["texte_resume"]})

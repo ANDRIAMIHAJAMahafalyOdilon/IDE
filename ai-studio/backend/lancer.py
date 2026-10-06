@@ -49,7 +49,14 @@ def installer_binaire_opencode() -> None:
         os.replace(temp, cible)
         os.environ["OPENCODE_BIN"] = str(cible)
     except OSError as exc:
-        print(f"CLI OpenCode non extraite ({exc}) : resolution via le PATH.")
+        # Le backend doit rester autonome même si l'antivirus ou une stratégie
+        # de poste interdit l'écriture dans %LOCALAPPDATA%. Le binaire est déjà
+        # dans le dossier temporaire de l'exécutable one-file : il est lisible
+        # et exécutable pendant toute la durée du processus.
+        os.environ["OPENCODE_BIN"] = str(bundle)
+        print(
+            f"CLI OpenCode non extraite ({exc}) : utilisation du binaire embarqué."
+        )
 
 
 installer_binaire_opencode()

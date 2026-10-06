@@ -101,7 +101,9 @@ class RequeteChat(BaseModel):
     aucune modification de fichier — jamais de `proposition`).
 
     `pieces` n'est honoré qu'en mode `chat` : ce sont les images et PDF choisis
-    avec le bouton « + » du composeur. Le mode edit n'a pas de pièce jointe.
+    avec le bouton « + » du composeur. Elles ne sont pas consommées : elles
+    s'ajoutent à celles que le fil retient déjà (voir POST /api/agent/chat/pieces).
+    Le mode edit n'a pas de pièce jointe.
     """
 
     pieces: list[PieceJoine] = Field(default_factory=list)
@@ -110,17 +112,34 @@ class RequeteChat(BaseModel):
     projet: str | None = None
     message: str
     session: str | None = None
+    # Identifiant du message frontend auquel les pièces seront rattachées.
+    message_id: str | None = None
     autoriser_modifications: bool = False
     # RAG (mode chat) : `documents` recherche dans les cours indexés et
     # `web` interroge DuckDuckGo pour ancrer la réponse (sources citées).
     documents: bool = False
     web: bool = False
+    # Secours pour les fils frontend créés avant la session backend durable. Le
+    # backend ne l'utilise que si aucune mémoire persistée n'existe encore.
+    historique_client: list[dict[str, str]] = Field(default_factory=list)
     # Chemins des fichiers de contexte (fichier ouvert dans l'éditeur, fichiers
     # cochés). Le CONTENU est lu côté backend — jamais envoyé par le frontend.
     fichiers_contexte: list[str] | None = None
     # Note dev : liste de {"chemin", "contenu"} permettant de tester le flux
     # complet (build_diff -> hunks -> SSE) sans dépendre du moteur réel.
     simulation: list[FichierSimule] | None = None
+
+
+class RequetePieces(BaseModel):
+    """Corps de POST /api/agent/chat/pieces : pièces à attacher au fil `session`.
+
+    Attacher une pièce est une opération distincte de l'envoi d'un message : elle
+    réussit immédiatement et la pièce reste disponible pour les requêtes suivantes,
+    ce qu'un envoi ne pourrait pas garantir.
+    """
+
+    session: str
+    pieces: list[PieceJoine] = Field(default_factory=list)
 
 
 class RequeteTacheControle(BaseModel):

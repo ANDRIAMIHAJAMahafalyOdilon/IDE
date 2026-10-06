@@ -26,6 +26,9 @@ export interface OptionsChat {
   web?: boolean;
   /** Pièces jointes image/PDF (mode chat uniquement), en base64. */
   pieces?: PieceJoine[];
+  messageId?: string | null;
+  /** Reprise locale d'un ancien fil dont le backend n'a pas encore d'historique. */
+  historique?: Array<{ question: string; reponse: string }>;
   signal?: AbortSignal;
 }
 
@@ -55,16 +58,24 @@ async function* parseFluxSSE(
   const reader = res.body.getReader();
   const decoder = new TextDecoder("utf-8");
   let buffer = "";
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buffer += decoder.decode(value, { stream: true });
-    const blocs = buffer.split(/\r?\n\r?\n/);
-    buffer = blocs.pop() ?? "";
-    for (const bloc of blocs) {
-      const evt = parseEvenement(bloc);
-      if (evt) yield evt as { event: string; data: unknown };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const blocs = buffer.split(/\r?\n\r?\n/);
+      buffer = blocs.pop() ?? "";
+      for (const bloc of blocs) {
+        const evt = parseEvenement(bloc);
+        if (evt) yield evt as { event: string; data: unknown };
+      }
     }
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new Error(
+      "Connexion interrompue avec le serveur AI Studio. Vérifie que l'application est bien démarrée.",
+      { cause: error },
+    );
   }
   const dernier = parseEvenement(buffer);
   if (dernier) yield dernier as { event: string; data: unknown };
@@ -83,16 +94,82 @@ export async function* chatAgent(
   if (opts.documents) body.documents = true;
   if (opts.web) body.web = true;
   if (opts.pieces?.length) body.pieces = opts.pieces;
+  if (opts.messageId) body.message_id = opts.messageId;
+  if (opts.historique?.length) body.historique_client = opts.historique;
 
-  const res = await fetch("/api/agent/chat", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
+  let res: Response;
+  try {
+    res = await fetch("/api/agent/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: opts.signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new Error(
+      "Impossible de joindre le serveur AI Studio. Vérifie que l'application est bien démarrée.",
+      { cause: error },
+    );
+  }
   for await (const evt of parseFluxSSE(res)) {
     yield evt as EvenementSSE;
   }
+}
+
+/** Inventaire des pièces retenues par un fil (jamais les octets : uniquement ce que
+ *  l'interface doit afficher). */
+export interface PieceRetenue {
+  cle: string;
+  nom: string;
+  mime: string;
+  ko: number;
+  size?: number;
+  etat?: "selected" | "uploading" | "processing" | "ready" | "error";
+  pages?: number | null;
+  created_at?: string | null;
+  message_id?: string | null;
+}
+
+/** URL opaque de preview : le serveur vérifie l'appartenance au fil avant
+ * d'ouvrir le fichier, et ne renvoie jamais son chemin physique. */
+export function urlPiece(session: string, cle: string, mode: "chat" | "edit" = "chat"): string {
+  return `/api/agent/chat/pieces/fichier?session=${encodeURIComponent(session)}&cle=${encodeURIComponent(cle)}&mode=${mode}`;
+}
+
+async function piecesReponse(res: Response): Promise<PieceRetenue[]> {
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}) as { detail?: string });
+    throw new Error(detail.detail ?? `Pièce jointe refusée (${res.status})`);
+  }
+  const corps = (await res.json()) as { pieces: PieceRetenue[] };
+  return corps.pieces ?? [];
+}
+
+/** Attache des pièces au fil : elles y restent pour toutes les requêtes suivantes. */
+export async function attacherPieces(
+  session: string,
+  pieces: PieceJoine[],
+): Promise<PieceRetenue[]> {
+  const res = await fetch("/api/agent/chat/pieces", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ session, pieces }),
+  });
+  return piecesReponse(res);
+}
+
+export async function listerPieces(session: string, mode: "chat" | "edit" = "chat"): Promise<PieceRetenue[]> {
+  const res = await fetch(`/api/agent/chat/pieces?session=${encodeURIComponent(session)}&mode=${mode}`);
+  return piecesReponse(res);
+}
+
+export async function retirerPiece(session: string, cle: string, mode: "chat" | "edit" = "chat"): Promise<PieceRetenue[]> {
+  const res = await fetch(
+    `/api/agent/chat/pieces?session=${encodeURIComponent(session)}&cle=${encodeURIComponent(cle)}&mode=${mode}`,
+    { method: "DELETE" },
+  );
+  return piecesReponse(res);
 }
 
 export async function* tacheAgent(

@@ -7,6 +7,19 @@ export interface MessageDisc {
   id: string;
   role: "user" | "assistant";
   texte: string;
+  /** Fichiers du message ; les octets restent persistés côté backend. */
+  attachments?: PieceMessage[];
+}
+
+export interface PieceMessage {
+  id: string;
+  message_id?: string;
+  filename: string;
+  mime_type: string;
+  size: number;
+  status?: "selected" | "uploading" | "processing" | "ready" | "error";
+  pages?: number | null;
+  previewUrl?: string;
 }
 
 export interface SessionDisc {
@@ -55,12 +68,19 @@ interface EtatDiscussions {
   nouvelle: (mode?: ModeAgent) => string;
   renommer: (id: string, titre: string) => void;
   supprimer: (id: string) => void;
-  ajouterMessage: (id: string, role: "user" | "assistant", texte: string) => void;
+  ajouterMessage: (
+    id: string,
+    role: "user" | "assistant",
+    texte: string,
+    attachments?: PieceMessage[],
+    messageId?: string,
+  ) => void;
+  associerPiecesMessages: (id: string, pieces: PieceMessage[]) => void;
   fusionnerDelta: (id: string, delta: string) => void;
   /** Vide la réponse en cours d'un assistant : utilisé sur `reprise`, quand le
    *  flux a été coupé et que le moteur de secours relance la réponse. */
   viderReponseEnCours: (id: string) => void;
-  fixer: (id: string, backend: string, moteur: string) => void;
+  fixer: (id: string, backend: string, moteur: string | null) => void;
   retirerAssistantVide: (id: string) => void;
 }
 
@@ -113,10 +133,11 @@ export const useDiscussions = create<EtatDiscussions>()(
           return { sessions, activeIds };
         }),
 
-      ajouterMessage: (id, role, texte) =>
+      ajouterMessage: (id, role, texte, attachments, messageId) =>
         set((s) => ({
           sessions: s.sessions.map((x) => {
             if (x.id !== id) return x;
+            const idMessage = messageId ?? genererIdMessage();
             const titre =
               x.titre === TITRE_PAR_DEFAUT && role === "user" && texte.trim()
                 ? titrer(texte)
@@ -124,10 +145,52 @@ export const useDiscussions = create<EtatDiscussions>()(
             return {
               ...x,
               titre,
-              messages: [...x.messages, { id: genererIdMessage(), role, texte }],
+              messages: [
+                ...x.messages,
+                {
+                  id: idMessage,
+                  role,
+                  texte,
+                  ...(attachments?.length
+                    ? {
+                        attachments: attachments.map((piece) => ({
+                          ...piece,
+                          message_id: idMessage,
+                          status: piece.status ?? "ready",
+                        })),
+                      }
+                    : {}),
+                },
+              ],
             };
           }),
         })),
+
+      associerPiecesMessages: (id, pieces) =>
+        set((s) => {
+          const parMessage = new Map<string, PieceMessage[]>();
+          for (const piece of pieces) {
+            if (!piece.message_id) continue;
+            const associees = parMessage.get(piece.message_id) ?? [];
+            associees.push(piece);
+            parMessage.set(piece.message_id, associees);
+          }
+          if (!parMessage.size) return s;
+          return {
+            sessions: s.sessions.map((session) => {
+              if (session.id !== id) return session;
+              return {
+                ...session,
+                messages: session.messages.map((message) => {
+                  const associees = parMessage.get(message.id);
+                  return associees?.length
+                    ? { ...message, attachments: associees }
+                    : message;
+                }),
+              };
+            }),
+          };
+        }),
 
       fusionnerDelta: (id, delta) =>
         set((s) => ({
@@ -180,7 +243,7 @@ export const useDiscussions = create<EtatDiscussions>()(
     }),
     {
       name: "ai-studio-discussions",
-      version: 3,
+      version: 4,
       migrate: (etatInconnu) => {
         // Les versions précédentes n'avaient qu'un historique global. On le
         // conserve dans Chat afin qu'une mise à jour ne fasse rien disparaître.
@@ -195,6 +258,8 @@ export const useDiscussions = create<EtatDiscussions>()(
           messages: (session.messages ?? []).map((message) => ({
             ...message,
             id: message.id ?? genererIdMessage(),
+            // Les anciennes versions appelaient ce champ `pieces`.
+            attachments: message.attachments ?? (message as MessageDisc & { pieces?: PieceMessage[] }).pieces,
           })),
         }));
         const anciensActifs = ancien.activeIds;

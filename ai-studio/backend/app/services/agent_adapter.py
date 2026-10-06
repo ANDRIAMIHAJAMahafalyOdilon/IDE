@@ -300,6 +300,7 @@ def proposer_modifications(
     chaine: str,
     sid_opencode: str | None,
     racine: Path,
+    pieces: list[dict[str, str]] | None = None,
 ) -> tuple[str, str]:
     """Appelle les moteurs dans l'ordre OpenCode -> Gemini -> Groq.
 
@@ -314,8 +315,12 @@ def proposer_modifications(
                 lambda c: opencode.envoyer_instruction(str(sid_opencode), racine, c),
             )
         )
-    engins.append(("gemini", moteurs.gemini_generer))
-    engins.append(("groq", moteurs.groq_generer))
+    if pieces:
+        engins.append(("gemini", lambda c: moteurs.gemini_generer(c, pieces=pieces)))
+        engins.append(("groq", lambda c: moteurs.groq_generer(c, pieces=pieces)))
+    else:
+        engins.append(("gemini", moteurs.gemini_generer))
+        engins.append(("groq", moteurs.groq_generer))
 
     erreurs: list[str] = []
     for nom, appel in engins:

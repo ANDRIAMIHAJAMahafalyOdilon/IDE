@@ -76,9 +76,9 @@ def _patch(flux_gemini, flux_groq, flux_opencode=None):
     obtenue. Un test qui veut réellement exercer OpenCode lui passe le flux
     d'origine.
 
-    L'ordre ne dépend plus des clés : OpenCode est toujours en tête. Les flux
-    cloud sont donc passés en PREMIER argument, pour que `flux_opencode` reste
-    le seul paramètre optionnel.
+    L'ordre du Chat est Groq, Gemini, puis OpenCode. Les flux cloud sont donc
+    passés en PREMIER argument, pour que `flux_opencode` reste le seul
+    paramètre optionnel.
     """
     def _casse(c):
         raise ErreurMoteur("moteur_indisponible", "opencode : hors sujet ici.")
@@ -113,23 +113,22 @@ def _reponse(prompt):
 
 
 def test_nuage_agrege_les_deltas():
-    """Gemini/Groq sont des SECOURS : une fois OpenCode neutralisé, ils
-    répondent normalement et leurs deltas sont agrégés tels quels."""
+    """Groq est le premier moteur et ses deltas sont agrégés tels quels."""
     sauv = _patch(lambda c: iter(["Bon", "jour"]), lambda c: iter(["jamais"]))
     try:
-        assert _reponse("prompt") == (["gemini"], ["Bon", "jour"])
+        assert _reponse("prompt") == (["groq"], ["jamais"])
     finally:
         _restaure(sauv)
 
 
-def test_bascule_groq_si_gemini_echoue_avant_token():
+def test_bascule_gemini_si_groq_echoue_avant_token():
     def casse(c):
         raise ErreurMoteur("quota", "gemini : quota dépassé.")
         yield  # pragma: no cover — fait de la fonction un générateur
 
     sauv = _patch(casse, lambda c: iter(["secours"]))
     try:
-        # Aucun delta n'ayant été émis, il n'y a rien à effacer : pas de reprise.
+        # Groq répond avant Gemini : aucun secours n'est nécessaire.
         assert _reponse("prompt") == (["groq"], ["secours"])
     finally:
         _restaure(sauv)
@@ -141,6 +140,29 @@ def test_flux_vide_passe_au_moteur_suivant():
         assert _reponse("prompt") == (["groq"], ["ok"])
     finally:
         _restaure(sauv)
+
+
+def test_reessaie_une_fois_groq_si_429_indique_un_delai_court():
+    appels = {"groq": 0}
+    attentes = []
+
+    def groq(c):
+        appels["groq"] += 1
+        if appels["groq"] == 1:
+            raise ErreurMoteur("quota", "groq : quota dépassé.", retry_after=1.5)
+        return iter(["réponse après quota"])
+
+    sauv = _patch(lambda c: iter(["ne doit pas arriver"]), groq)
+    original_sleep = agent_discussion.time.sleep
+    agent_discussion.time.sleep = attentes.append
+    try:
+        assert _reponse("prompt") == (["groq"], ["réponse après quota"])
+    finally:
+        agent_discussion.time.sleep = original_sleep
+        _restaure(sauv)
+
+    assert appels["groq"] == 2
+    assert attentes == [1.7]
 
 
 def test_tous_echecs_leve_moteur_indisponible():
@@ -163,18 +185,18 @@ def test_tous_echecs_leve_moteur_indisponible():
         _restaure(sauv)
 
 
-def test_coupure_en_cours_de_flux_bascule_sans_coupure():
+def test_coupure_groq_en_cours_de_flux_bascule_vers_gemini():
     """Exigence : aucune coupure visible pendant la discussion.
 
-    Gemini s'interrompt APRÈS avoir envoyé des tokens. Le service doit
-    basculer sur Groq, signaler `reprise` (le client efface alors le partiel)
+    Groq s'interrompt APRÈS avoir envoyé des tokens. Le service doit
+    basculer sur Gemini, signaler `reprise` (le client efface alors le partiel)
     et diffuser une réponse complète — pas laisser une phrase coupée."""
     def mi_flux(c):
         yield "début de réponse"
         yield "qui s'inter"
-        raise ErreurMoteur("timeout", "gemini : délai dépassé.")
+        raise ErreurMoteur("timeout", "groq : délai dépassé.")
 
-    sauv = _patch(mi_flux, lambda c: iter(["réponse", "complète"]))
+    sauv = _patch(lambda c: iter(["réponse", "complète"]), mi_flux)
     try:
         evenements = list(agent_discussion.stream_reponse("prompt"))
     finally:
@@ -182,10 +204,10 @@ def test_coupure_en_cours_de_flux_bascule_sans_coupure():
 
     genres = [e[0] for e in evenements]
     assert genres == ["moteur", "delta", "delta", "reprise", "delta", "delta"]
-    assert evenements[0] == ("moteur", "gemini")
+    assert evenements[0] == ("moteur", "groq")
     reprise = evenements[3]
     assert reprise[0] == "reprise"
-    assert reprise[1][0] == "groq"
+    assert reprise[1][0] == "gemini"
     assert "délai dépassé" in reprise[1][1]
     deltas = [c for g, c in evenements if g == "delta"]
     assert deltas == ["début de réponse", "qui s'inter", "réponse", "complète"]
@@ -194,7 +216,7 @@ def test_coupure_en_cours_de_flux_bascule_sans_coupure():
 
 
 def test_plus_de_reprise_emise_quand_le_secours_echoue():
-    """Groq tombe aussi : plus rien à basculer, on remonte l'échec — et on ne
+    """Gemini tombe aussi : plus rien à basculer, on remonte l'échec — et on ne
     signale PAS une seconde reprise (le client n'aurait rien à effacer)."""
     def coupe(c):
         yield "a"
@@ -203,7 +225,7 @@ def test_plus_de_reprise_emise_quand_le_secours_echoue():
 
     def coupe_aussi(c):
         yield "b"
-        raise ErreurMoteur("timeout", "groq : délai.")
+        raise ErreurMoteur("timeout", "gemini : délai.")
         yield  # pragma: no cover
 
     sauv = _patch(coupe, coupe_aussi)
@@ -223,10 +245,8 @@ def test_plus_de_reprise_emise_quand_le_secours_echoue():
 def test_bascule_en_chaine_puis_echec_final():
     """Toute la chaîne tombe : une reprise par bascule, puis l'échec remonte.
 
-    OpenCode échoue tout en premier et SANS streamer : il ne produit ni delta ni
-    `reprise` — le client n'a rien à effacer. La seule bascule visible est donc
-    celle de Gemini vers Groq, et Groq tombant en dernier il n'y a plus de moteur
-    derrière elle pour justifier une seconde reprise.
+    Groq puis Gemini streament un fragment avant de tomber. OpenCode, dernier
+    secours, échoue sans streamer et il n'y a plus de moteur derrière lui.
     """
     def coupe(nom, texte):
         def _f(c):
@@ -248,15 +268,13 @@ def test_bascule_en_chaine_puis_echec_final():
             raise AssertionError("ErreurMoteur attendue en fin de chaîne")
     finally:
         _restaure(sauv)
-    assert genres == ["moteur", "delta", "reprise", "delta"], genres
+    assert genres == ["moteur", "delta", "reprise", "delta", "reprise"], genres
 
 
 def test_moteur_vide_puis_secours_coupe_sans_reprise():
-    """Gemini ne renvoie rien, Groq stream puis coupe : AUCUNE reprise.
+    """Gemini ne renvoie rien après que Groq a streamé puis coupé.
 
-    Rien n'ayant été affiché avant la coupure de Groq, le client n'a rien à
-    effacer ; et comme OpenCode a déjà échoué en tête de chaîne, il ne reste
-    personne pour lui succéder.
+    La reprise vers Gemini est annoncée, puis OpenCode échoue à son tour.
     """
     def vide(c):
         return iter([])
@@ -279,29 +297,31 @@ def test_moteur_vide_puis_secours_coupe_sans_reprise():
             raise AssertionError("ErreurMoteur attendue en fin de chaîne")
     finally:
         _restaure(sauv)
-    assert genres == ["moteur", "delta"], genres
+    assert genres == ["moteur", "delta", "reprise"], genres
 
 
-# ─────────────────── Moteur OpenCode du Chat (toujours en tête) ───────────────
+# ─────────────────────── Ordre des moteurs du Chat ───────────────────────────
 
-def test_opencode_est_en_tete_de_la_chaine():
-    """Le moteur embarqué répond, la clé Gemini ne doit pas détourner la
-    conversation vers un service distant : sa place ne dépend d'aucune clé."""
+def test_groq_est_en_tete_de_la_chaine():
+    """Le Chat personnel tente Groq, puis Gemini, puis OpenCode."""
     sauv = _patch(lambda c: iter([]), lambda c: iter([]))
     try:
         noms = [n for n, _ in agent_discussion._engins()]
     finally:
         _restaure(sauv)
-    assert noms == ["opencode", "gemini", "groq"]
+    assert noms == ["groq", "gemini", "opencode"]
 
 
-def test_nuage_en_secours_pas_en_defaut():
-    """Gemini et Groq restent atteignables si OpenCode échoue, mais ne sont
-    jamais essayés avant lui."""
+def test_opencode_reste_dernier_secours():
+    """OpenCode reste disponible après l'échec des deux moteurs cloud."""
     import app.services.opencode as oc
 
+    def cloud_indisponible(c):
+        raise ErreurMoteur("moteur_indisponible", "cloud indisponible")
+        yield  # pragma: no cover
+
     orig_flux = agent_discussion._flux_opencode
-    sauv = _patch(lambda c: iter(["nuage"]), lambda c: iter(["groq"]), orig_flux)
+    sauv = _patch(cloud_indisponible, cloud_indisponible, orig_flux)
     orig = oc.repondre_chat
     oc.repondre_chat = lambda racine, prompt, timeout=None, images=None: "embarque"
     try:

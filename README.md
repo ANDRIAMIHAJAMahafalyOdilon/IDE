@@ -30,6 +30,18 @@ ai-studio/
 
 ## Démarrage
 
+Le lancement recommandé sous Windows est non bloquant :
+
+```powershell
+.\demarrer-ai-studio.cmd
+```
+
+Le script réutilise une instance déjà démarrée, démarre les services en arrière-plan,
+attend leur disponibilité et ouvre `http://127.0.0.1:5173/`. Pour ne pas ouvrir le
+navigateur : `powershell -ExecutionPolicy Bypass -File .\ai-studio\demarrer.ps1 -NePasOuvrir`.
+
+Lancement manuel, si nécessaire :
+
 ```bash
 # backend (Windows) — venv déjà créé
 ai-studio\backend\venv\Scripts\python -m uvicorn app.main:app --host 127.0.0.1 --port 8010

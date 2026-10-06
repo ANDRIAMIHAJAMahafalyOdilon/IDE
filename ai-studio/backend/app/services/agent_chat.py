@@ -121,6 +121,8 @@ def generer_propositions_moteur(
     fichiers_contexte: list[str] | None,
     memoire: list[dict[str, Any]],
     sid_opencode: str | None,
+    bloc_pieces: str = "",
+    pieces: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """Propose des modifications via le vrai moteur.
 
@@ -130,14 +132,22 @@ def generer_propositions_moteur(
     arborescence, bloc_fichiers = _construire_contexte(
         racine, fichiers_contexte, mode_edit=True
     )
+    instruction_avec_pieces = instruction
+    if bloc_pieces:
+        instruction_avec_pieces += (
+            "\n\nContexte des pièces jointes de cette session. Utilise-le si la "
+            "consigne y fait référence :\n" + bloc_pieces
+        )
     prompt = agent_adapter.construire_prompt(
-        instruction,
+        instruction_avec_pieces,
         arborescence,
         bloc_fichiers,
         _construire_memoire(memoire),
         budget_car=CONTEXTE_EDIT_MAX_CAR,
     )
-    moteur, brut = agent_adapter.proposer_modifications(prompt, sid_opencode, racine)
+    moteur, brut = agent_adapter.proposer_modifications(
+        prompt, sid_opencode, racine, pieces=pieces
+    )
 
     bruts = agent_adapter.parser_propositions(brut, racine)
     propositions: list[dict[str, Any]] = []
